@@ -10,11 +10,19 @@ pub const Diagnostic = struct {
     line: u32,
     column: u32,
     message: []const u8,
+    stage: ?@import("options.zig").Stage = null,
+    source_name: []const u8 = "",
+    code: Code = .source,
 };
+
+pub const Code = enum { source, unsupported, type_mismatch, link, invalid_ir };
 
 pub const Diagnostics = struct {
     allocator: std.mem.Allocator,
     items: std.ArrayList(Diagnostic) = .empty,
+    stage: ?@import("options.zig").Stage = null,
+    source_name: []const u8 = "",
+    code: Code = .source,
 
     pub fn init(allocator: std.mem.Allocator) Diagnostics {
         return .{ .allocator = allocator };
@@ -26,6 +34,9 @@ pub const Diagnostics = struct {
             .line = line,
             .column = column,
             .message = message,
+            .stage = self.stage,
+            .source_name = self.source_name,
+            .code = self.code,
         });
     }
 

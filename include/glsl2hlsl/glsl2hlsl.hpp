@@ -4,6 +4,7 @@
 #include "glsl2hlsl.h"
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -21,7 +22,8 @@ enum class Status {
     Ok = GLSL2HLSL_STATUS_OK,
     InvalidShader = GLSL2HLSL_STATUS_INVALID_SHADER,
     OutOfMemory = GLSL2HLSL_STATUS_OUT_OF_MEMORY,
-    InvalidArgument = GLSL2HLSL_STATUS_INVALID_ARGUMENT
+    InvalidArgument = GLSL2HLSL_STATUS_INVALID_ARGUMENT,
+    UnsupportedTarget = GLSL2HLSL_STATUS_UNSUPPORTED_TARGET
 };
 
 enum class Severity {
@@ -55,6 +57,8 @@ inline const char *to_string(Status status) noexcept {
         return "out of memory";
     case Status::InvalidArgument:
         return "invalid argument";
+    case Status::UnsupportedTarget:
+        return "unsupported target";
     }
     return "unknown";
 }
@@ -115,6 +119,68 @@ struct ResultOwner {
 
 [[nodiscard]] inline const char *version() noexcept {
     return glsl2hlsl_version();
+}
+
+enum class Coordinates {
+    OpenGL = GLSL2HLSL_DXIL_OPENGL,
+    D3D12Native = GLSL2HLSL_DXIL_D3D12_NATIVE
+};
+
+struct GraphicsRequest {
+    std::string_view vertex;
+    std::string_view fragment;
+    std::string_view vertex_name = "vertex";
+    std::string_view fragment_name = "fragment";
+    glsl2hlsl_shader_model shader_model = GLSL2HLSL_SM_6_5;
+    Coordinates coordinates = Coordinates::OpenGL;
+};
+
+class GraphicsResult {
+    glsl2hlsl_dxil_graphics_result value_{};
+
+public:
+    GraphicsResult() = default;
+    GraphicsResult(const GraphicsResult &) = delete;
+    GraphicsResult &operator=(const GraphicsResult &) = delete;
+    GraphicsResult(GraphicsResult &&other) noexcept : value_(std::exchange(other.value_, {})) {}
+    GraphicsResult &operator=(GraphicsResult &&other) noexcept {
+        if (this != &other) {
+            glsl2hlsl_dxil_graphics_result_free(&value_);
+            value_ = std::exchange(other.value_, {});
+        }
+        return *this;
+    }
+    ~GraphicsResult() { glsl2hlsl_dxil_graphics_result_free(&value_); }
+
+    [[nodiscard]] Status status() const noexcept { return static_cast<Status>(value_.status); }
+    [[nodiscard]] explicit operator bool() const noexcept { return value_.owner && status() == Status::Ok; }
+    [[nodiscard]] std::span<const std::uint8_t> vertex() const noexcept { return {value_.vertex, value_.vertex_length}; }
+    [[nodiscard]] std::span<const std::uint8_t> fragment() const noexcept { return {value_.fragment, value_.fragment_length}; }
+    [[nodiscard]] const glsl2hlsl_dxil_graphics_result &reflection() const noexcept { return value_; }
+    [[nodiscard]] std::span<const glsl2hlsl_dxil_graphics_diagnostic> diagnostics() const noexcept { return {value_.diagnostics, value_.diagnostic_count}; }
+
+    friend GraphicsResult compile_graphics(const GraphicsRequest &) noexcept;
+};
+
+[[nodiscard]] inline GraphicsResult compile_graphics(const GraphicsRequest &request) noexcept {
+    glsl2hlsl_dxil_graphics_options options{};
+    options.vertex_source = request.vertex.data();
+    options.vertex_source_length = request.vertex.size();
+    options.fragment_source = request.fragment.data();
+    options.fragment_source_length = request.fragment.size();
+    options.vertex_name = request.vertex_name.data();
+    options.vertex_name_length = request.vertex_name.size();
+    options.fragment_name = request.fragment_name.data();
+    options.fragment_name_length = request.fragment_name.size();
+    options.shader_model = request.shader_model;
+    options.coordinates = static_cast<glsl2hlsl_dxil_coordinates>(std::to_underlying(request.coordinates));
+    GraphicsResult result;
+    result.value_.status = glsl2hlsl_dxil_compile_graphics(&options, &result.value_);
+    return result;
+}
+
+[[nodiscard]] inline Status prepare_gl_state(const glsl2hlsl_dxil_gl_state &state, glsl2hlsl_dxil_gl_prepared &prepared) noexcept {
+    return static_cast<Status>(glsl2hlsl_dxil_prepare_gl_state(&state, &prepared));
 }
 
 }

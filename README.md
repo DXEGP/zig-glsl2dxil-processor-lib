@@ -77,6 +77,7 @@ Detailed documentation is currently in Chinese:
 - [docs/cpp-api.md](docs/cpp-api.md): C ABI, C++ wrapper, linking, and ownership
 - [docs/design.md](docs/design.md): implementation and design decisions
 - [docs/glsl-hlsl-mapping.md](docs/glsl-hlsl-mapping.md): GLSL-to-HLSL mapping rules
+- [docs/dxil.md](docs/dxil.md): pure Zig DXIL compilation, reflection, OpenGL state mapping, and hardware acceptance
 
 See [README_zh.md](README_zh.md) for this README in Chinese.
 
@@ -90,6 +91,10 @@ powershell -File tests/run.ps1
 ```
 
 `cpp-test` builds the same interoperability test with both `-std=c++23` and `-std=c++26`. `tests/run.ps1` also converts every shader under `tests/shaders` and `examples`, validating the output with `dxc.exe` when it is available.
+
+The experimental DXIL backend compiles paired GLSL vertex/pixel sources directly to SM 6.5 / DXIL 1.5. It supports typed scalar SSA, functions and control flow, float matrices, reflected uniforms, sampler2D descriptor tables, and configurable OpenGL coordinate/draw state. Zig uses `compileGraphics`; C uses `glsl2hlsl_dxil_compile_graphics`; C++23/26 provides a move-only `GraphicsResult`. Upload uniforms using the returned cbuffer offsets and strides.
+
+Run `zig build test c-test cpp-test dxil-c-test dxil-source-fixtures`, `zig build dxil-source-bench -Doptimize=ReleaseSafe`, or `pwsh -NoProfile -File tests/dxil/run.ps1` for Windows validator and hardware acceptance, including the existing 10 shaders and 96 OpenGL state combinations. The compiler core has no DXC/LLVM dependency; official tools are used only during development. SM 6.9, general GLSL/package compatibility, UBO/SSBO, sampler arrays, and dynamic writes to local aggregates remain unsupported; see the [support contract](docs/dxil.md#m2glsl-源码编译与反射).
 
 ## Limitations
 

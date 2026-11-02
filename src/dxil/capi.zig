@@ -1,0 +1,179 @@
+const std = @import("std");
+const graphics = @import("graphics.zig");
+const diag = @import("../diag.zig");
+const sema = @import("sema.zig");
+const ir = @import("ir.zig");
+const compat = @import("compat.zig");
+const allocator = std.heap.page_allocator;
+
+pub const Type = extern struct { scalar: u32, rows: u32, columns: u32, array_length: u32, structure_index: u32 };
+pub const Uniform = extern struct { name: [*:0]const u8, name_length: usize, typ: Type, offset: u32, size: u32, array_stride: u32, matrix_stride: u32, stages: u32 };
+pub const Binding = extern struct { name: [*:0]const u8, name_length: usize, resource_class: u32, binding: u32, space: u32, size: u32, stages: u32 };
+pub const Field = extern struct { name: [*:0]const u8, name_length: usize, typ: Type, offset: u32 };
+pub const Structure = extern struct { name: [*:0]const u8, name_length: usize, fields: [*]const Field, field_count: usize, size: u32 };
+pub const Signature = extern struct { name: [*:0]const u8, name_length: usize, semantic_index: u32, row: u32, columns: u32, scalar: u32, semantic: u32, interpolation: u32, stage: u32, is_input: u32 };
+pub const Diagnostic = extern struct { severity: u32, stage: u32, code: u32, line: u32, column: u32, source_name: [*:0]const u8, source_name_length: usize, message: [*:0]const u8, message_length: usize };
+pub const Options = extern struct {
+    vertex_source: ?[*]const u8,
+    vertex_source_length: usize,
+    vertex_name: ?[*]const u8,
+    vertex_name_length: usize,
+    fragment_source: ?[*]const u8,
+    fragment_source_length: usize,
+    fragment_name: ?[*]const u8,
+    fragment_name_length: usize,
+    shader_model: c_int,
+    coordinates: c_int,
+};
+pub const Result = extern struct {
+    status: c_int = 0,
+    owner: ?*anyopaque = null,
+    vertex: ?[*]const u8 = null,
+    vertex_length: usize = 0,
+    fragment: ?[*]const u8 = null,
+    fragment_length: usize = 0,
+    reflection_version: u32 = 0,
+    coordinates: u32 = 0,
+    uniforms: ?[*]const Uniform = null,
+    uniform_count: usize = 0,
+    bindings: ?[*]const Binding = null,
+    binding_count: usize = 0,
+    structures: ?[*]const Structure = null,
+    structure_count: usize = 0,
+    signatures: ?[*]const Signature = null,
+    signature_count: usize = 0,
+    diagnostics: ?[*]const Diagnostic = null,
+    diagnostic_count: usize = 0,
+};
+const Owner = struct { arena: std.heap.ArenaAllocator, result: ?graphics.GraphicsResult = null };
+
+pub fn free(result: ?*Result) void {
+    const value = result orelse return;
+    if (value.owner) |pointer| {
+        const owner: *Owner = @ptrCast(@alignCast(pointer));
+        if (owner.result) |*owned| owned.deinit();
+        owner.arena.deinit();
+        allocator.destroy(owner);
+    }
+    value.* = .{};
+}
+
+fn outOfMemory(result: *Result) c_int {
+    free(result);
+    result.status = 2;
+    return 2;
+}
+fn slice(pointer: ?[*]const u8, length: usize) []const u8 {
+    return if (length == 0) "" else pointer.?[0..length];
+}
+fn convertType(typ: sema.Type) Type {
+    return .{ .scalar = @backingInt(typ.scalar), .rows = typ.rows, .columns = typ.cols, .array_length = typ.array_len, .structure_index = typ.structure };
+}
+
+pub fn compile(request: ?*const Options, out_result: ?*Result) c_int {
+    const result = out_result orelse return 3;
+    result.* = .{};
+    const options = request orelse {
+        result.status = 3;
+        return 3;
+    };
+    if ((options.vertex_source == null and options.vertex_source_length != 0) or (options.fragment_source == null and options.fragment_source_length != 0) or (options.vertex_name == null and options.vertex_name_length != 0) or (options.fragment_name == null and options.fragment_name_length != 0) or options.coordinates < 0 or options.coordinates > 1 or (options.shader_model != 65 and options.shader_model != 69)) {
+        result.status = 3;
+        return 3;
+    }
+    if (options.shader_model == 69) {
+        result.status = 4;
+        return 4;
+    }
+    const owner = allocator.create(Owner) catch return outOfMemory(result);
+    owner.* = .{ .arena = std.heap.ArenaAllocator.init(allocator) };
+    result.owner = owner;
+    const scratch = owner.arena.allocator();
+    var diagnostics = diag.Diagnostics.init(scratch);
+    owner.result = graphics.compileGraphics(allocator, .{
+        .vertex = .{ .source = slice(options.vertex_source, options.vertex_source_length), .name = slice(options.vertex_name, options.vertex_name_length) },
+        .fragment = .{ .source = slice(options.fragment_source, options.fragment_source_length), .name = slice(options.fragment_name, options.fragment_name_length) },
+        .coordinates = if (options.coordinates == 0) .opengl else .d3d12_native,
+    }, &diagnostics) catch |err| switch (err) {
+        error.OutOfMemory => return outOfMemory(result),
+        error.UnsupportedTarget => {
+            free(result);
+            result.status = 4;
+            return 4;
+        },
+        error.InvalidShader => null,
+    };
+    copyDiagnostics(scratch, diagnostics.items.items, result) catch return outOfMemory(result);
+    if (owner.result) |*compiled| {
+        copyReflection(scratch, compiled.reflection, result) catch return outOfMemory(result);
+        result.vertex = compiled.vertex.ptr;
+        result.vertex_length = compiled.vertex.len;
+        result.fragment = compiled.fragment.ptr;
+        result.fragment_length = compiled.fragment.len;
+        result.status = 0;
+    } else result.status = 1;
+    return result.status;
+}
+
+fn copyDiagnostics(scratch: std.mem.Allocator, source: []const diag.Diagnostic, result: *Result) !void {
+    if (source.len == 0) return;
+    const copied = try scratch.alloc(Diagnostic, source.len);
+    for (copied, source) |*destination, item| destination.* = .{
+        .severity = @backingInt(item.kind),
+        .stage = if (item.stage) |stage| (if (stage == .vertex) @as(u32, 1) else 2) else 0,
+        .code = @backingInt(item.code),
+        .line = item.line,
+        .column = item.column,
+        .source_name = try scratch.dupeSentinel(u8, item.source_name, 0),
+        .source_name_length = item.source_name.len,
+        .message = try scratch.dupeSentinel(u8, item.message, 0),
+        .message_length = item.message.len,
+    };
+    result.diagnostics = copied.ptr;
+    result.diagnostic_count = copied.len;
+}
+
+fn copyReflection(scratch: std.mem.Allocator, reflection: graphics.Reflection, result: *Result) !void {
+    const uniforms = try scratch.alloc(Uniform, reflection.uniforms.len);
+    for (uniforms, reflection.uniforms) |*destination, source| destination.* = .{ .name = try scratch.dupeSentinel(u8, source.name, 0), .name_length = source.name.len, .typ = convertType(source.typ), .offset = source.offset, .size = source.size, .array_stride = source.array_stride, .matrix_stride = source.matrix_stride, .stages = source.stages };
+    result.uniforms = if (uniforms.len == 0) null else uniforms.ptr;
+    result.uniform_count = uniforms.len;
+    const bindings = try scratch.alloc(Binding, reflection.bindings.len);
+    for (bindings, reflection.bindings) |*destination, source| destination.* = .{ .name = try scratch.dupeSentinel(u8, source.name, 0), .name_length = source.name.len, .resource_class = @backingInt(source.class), .binding = source.binding, .space = source.space, .size = source.size, .stages = source.stages };
+    result.bindings = if (bindings.len == 0) null else bindings.ptr;
+    result.binding_count = bindings.len;
+    const structures = try scratch.alloc(Structure, reflection.structures.len);
+    for (structures, reflection.structures) |*destination, source| {
+        const fields = try scratch.alloc(Field, source.fields.len);
+        for (fields, source.fields) |*field, item| field.* = .{ .name = try scratch.dupeSentinel(u8, item.name, 0), .name_length = item.name.len, .typ = convertType(item.typ), .offset = item.offset };
+        destination.* = .{ .name = try scratch.dupeSentinel(u8, source.decl.name, 0), .name_length = source.decl.name.len, .fields = fields.ptr, .field_count = fields.len, .size = source.size };
+    }
+    result.structures = if (structures.len == 0) null else structures.ptr;
+    result.structure_count = structures.len;
+    var signatures: std.ArrayList(Signature) = .empty;
+    const groups = [_][]const ir.Signature{ reflection.vertex_inputs, reflection.vertex_outputs, reflection.fragment_inputs, reflection.fragment_outputs };
+    for (groups, 0..) |group, index| for (group) |source| {
+        try signatures.append(scratch, .{ .name = try scratch.dupeSentinel(u8, source.name, 0), .name_length = source.name.len, .semantic_index = source.index, .row = source.row, .columns = source.columns, .scalar = switch (source.scalar) {
+            .float => 4,
+            .int => 2,
+            .uint => 3,
+        }, .semantic = @backingInt(source.semantic), .interpolation = source.interpolation, .stage = if (index < 2) 1 else 2, .is_input = if (index % 2 == 0) 1 else 0 });
+    };
+    result.signatures = if (signatures.items.len == 0) null else signatures.items.ptr;
+    result.signature_count = signatures.items.len;
+    result.reflection_version = reflection.schema_version;
+    result.coordinates = @backingInt(reflection.coordinates);
+}
+
+pub const GlState = extern struct { clip_origin: u32, clip_depth: u32, winding: u32, viewport_x: f32, viewport_y: f32, viewport_width: f32, viewport_height: f32, target_height: f32, depth_near: f32, depth_far: f32, base_instance: u32 };
+pub const GlPrepared = extern struct { constants: [8]u32, viewport: [6]f32, front_counter_clockwise: u32, start_instance_location: u32 };
+
+pub fn prepare(state: ?*const GlState, prepared: ?*GlPrepared) c_int {
+    const output = prepared orelse return 3;
+    output.* = std.mem.zeroes(GlPrepared);
+    const input = state orelse return 3;
+    if (input.clip_origin > 1 or input.clip_depth > 1 or input.winding > 1) return 3;
+    const value = compat.prepare(.{ .clip_origin = @fromBackingInt(@intCast(input.clip_origin)), .clip_depth = @fromBackingInt(@intCast(input.clip_depth)), .winding = @fromBackingInt(@intCast(input.winding)), .viewport_x = input.viewport_x, .viewport_y = input.viewport_y, .viewport_width = input.viewport_width, .viewport_height = input.viewport_height, .target_height = input.target_height, .depth_near = input.depth_near, .depth_far = input.depth_far, .base_instance = input.base_instance }) catch return 3;
+    output.* = .{ .constants = value.constants, .viewport = value.viewport, .front_counter_clockwise = @intFromBool(value.front_counter_clockwise), .start_instance_location = value.start_instance_location };
+    return 0;
+}

@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <string_view>
+#include <type_traits>
 
 namespace {
 
@@ -25,6 +26,20 @@ int report(const char *message, int failures) {
 
 int main() {
     int failures = 0;
+    static_assert(!std::is_copy_constructible_v<glsl2hlsl::GraphicsResult>);
+    static_assert(std::is_nothrow_move_constructible_v<glsl2hlsl::GraphicsResult>);
+    auto graphics = glsl2hlsl::compile_graphics({
+        .vertex = "layout(location=0) in vec4 p; void main(){gl_Position=p;}",
+        .fragment = "out vec4 c; void main(){c=vec4(1);}",
+        .coordinates = glsl2hlsl::Coordinates::D3D12Native
+    });
+    if (!graphics || graphics.vertex().empty() || graphics.fragment().empty()) failures = report("graphics compilation failed", failures);
+    const auto *original = graphics.vertex().data();
+    auto moved = std::move(graphics);
+    if (graphics || !moved || moved.vertex().data() != original) failures = report("graphics move construction failed", failures);
+    glsl2hlsl::GraphicsResult assigned;
+    assigned = std::move(moved);
+    if (moved || !assigned || assigned.vertex().data() != original) failures = report("graphics move assignment failed", failures);
 
     constexpr std::string_view vertex_source =
         "#version 330 core\n"

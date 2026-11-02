@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "zig": "0.17.0",
+  "target": "SM 6.5 / DXIL 1.5 / validator compatibility 1.5 / PSV v1",
+  "references": {
+    "DirectXShaderCompiler": "f9fc72ad3fd796227400ef6f52097968f843f7ee",
+    "hlsl-specs": "9a8866f45599457900876fba0d02caf3a1e8544c",
+    "DirectX-Specs": "d5f41d531fdcce7fac624d2a619ba1e980e5163e"
+  },
+  "hashReference": {
+    "path": "lib/DxilHash/DxilHash.cpp",
+    "sha256": "D66B631EA28D4C90A8217FAC004F9290EAAC07F79115451E0C4E954C0B0C94AF"
+  },
+  "glReference": {
+    "repository": "KhronosGroup/OpenGL-Registry",
+    "commit": "1f8f4efc1d610052492e1099690822c68e4efb20",
+    "path": "extensions/ARB/ARB_clip_control.txt",
+    "additionalSpecifications": ["OpenGL 4.6 Core sections 13.5, 13.6, 14.6", "GLSL 4.60 gl_FragCoord and gl_InstanceID"]
+  },
+  "observedTools": {
+    "dxcVersion": "1.9.0.5512 (01b62ad47)",
+    "dxcExeSha256": "3E5D38EF9DA6CE20A62EE77B60D7EC750899788EC80EA03D9B861CBC097C8692",
+    "dxcompilerDllSha256": "8C143A53951B9109D40AE8EF530DE4340A24A539E272C34CF38B7BA2F9621FFE"
+  },
+  "formats": [
+    { "path": "include/llvm/Bitcode/LLVMBitCodes.h", "sha256": "F242EEC309B4F666641E8E848465685357A323B300DA63AE9F5287A3C459D46D" },
+    { "path": "lib/Bitcode/Writer/BitcodeWriter.cpp", "sha256": "DB01F3135C73439D6D0B4C9ADD895A8210F98CB6D7A175E4227E73DF7418F688" },
+    { "path": "include/dxc/DxilContainer/DxilPipelineStateValidation.h", "sha256": "3E95CF63C823CEEBEBA513637B0876FDF6762BA4AFAFAD418224ADCC99B2935E" },
+    { "path": "lib/DxilContainer/DxilPipelineStateValidation.cpp", "sha256": "BD6648775BC408EF6211EF569A08628A9A3F42AFB03ED655229D381D42BEF714" },
+    { "path": "lib/DxilContainer/DxilContainerAssembler.cpp", "sha256": "9F836C09D436FEE655389984D11D40F388AAB88C11FFA8ED64D98034E39F0C3C" },
+    { "path": "include/dxc/DxilContainer/DxilContainer.h", "sha256": "F9975FB71C62F1AA37CBA989ADC83F7DCBB06D48E36A62A0B2EBF29C26EAA397" },
+    { "path": "LICENSE.TXT", "sha256": "27A49E35D1DA96EBA18FBA54BC882667FF0FF8C0254F16F2B6E165D605BA7DF8" }
+  ]
+}

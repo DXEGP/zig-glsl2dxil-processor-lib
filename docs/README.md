@@ -83,6 +83,7 @@ dxc -T ps_6_0 -E main triangle_ps.hlsl
 - [用法](usage.md)：命令行、阶段推断、退出码与 Zig API。
 - [C/C++ 接口](cpp-api.md)：C ABI、C++ 封装、链接方式与内存管理。
 - [设计](design.md)：流水线、模块职责、关键取舍与后续计划。
+- [DXIL M0/M1/M2](dxil.md)：纯 Zig SM 6.5 源码编译、固定参考、反射、GL 状态契约与硬件验收。
 - [GLSL 与 HLSL 映射](glsl-hlsl-mapping.md)：类型、限定符、内置变量、内置函数、纹理与运算符的完整对照，以及当前不支持的语法。
 
 ## 验证

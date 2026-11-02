@@ -2,6 +2,18 @@ const std = @import("std");
 const converter = @import("converter.zig");
 const diag = @import("diag.zig");
 const options = @import("options.zig");
+const dxil = @import("dxil/container.zig");
+const graphics_capi = @import("dxil/capi.zig");
+
+export fn glsl2hlsl_dxil_compile_graphics(request: ?*const graphics_capi.Options, result: ?*graphics_capi.Result) c_int {
+    return graphics_capi.compile(request, result);
+}
+export fn glsl2hlsl_dxil_graphics_result_free(result: ?*graphics_capi.Result) void {
+    graphics_capi.free(result);
+}
+export fn glsl2hlsl_dxil_prepare_gl_state(state: ?*const graphics_capi.GlState, prepared: ?*graphics_capi.GlPrepared) c_int {
+    return graphics_capi.prepare(state, prepared);
+}
 
 const allocator = std.heap.page_allocator;
 
@@ -9,6 +21,7 @@ pub const STATUS_OK: c_int = 0;
 pub const STATUS_INVALID_SHADER: c_int = 1;
 pub const STATUS_OUT_OF_MEMORY: c_int = 2;
 pub const STATUS_INVALID_ARGUMENT: c_int = 3;
+pub const STATUS_UNSUPPORTED_TARGET: c_int = 4;
 
 pub const STAGE_AUTO: c_int = 0;
 pub const STAGE_VERTEX: c_int = 1;
@@ -165,6 +178,80 @@ export fn glsl2hlsl_result_free(result: ?*Result) void {
 
 export fn glsl2hlsl_version() [*:0]const u8 {
     return "0.1.0";
+}
+
+pub const DxilOptions = extern struct {
+    program: c_int,
+    shader_model: c_int,
+    color: [4]f32,
+};
+
+pub const DxilResult = extern struct {
+    status: c_int = STATUS_OK,
+    output: ?[*]u8 = null,
+    output_length: usize = 0,
+};
+
+export fn glsl2hlsl_dxil_emit(request: ?*const DxilOptions, out_result: ?*DxilResult) c_int {
+    const result = out_result orelse return STATUS_INVALID_ARGUMENT;
+    result.* = .{};
+    const opts = request orelse {
+        result.status = STATUS_INVALID_ARGUMENT;
+        return result.status;
+    };
+    const target: dxil.Target = switch (opts.shader_model) {
+        65 => .sm65,
+        69 => .sm69,
+        else => {
+            result.status = STATUS_INVALID_ARGUMENT;
+            return result.status;
+        },
+    };
+    const program: dxil.Program = switch (opts.program) {
+        0 => .vertex_passthrough,
+        1 => .{ .fragment_constant = opts.color },
+        else => {
+            result.status = STATUS_INVALID_ARGUMENT;
+            return result.status;
+        },
+    };
+    const output = dxil.emit(allocator, program, target) catch |err| {
+        result.status = switch (err) {
+            error.OutOfMemory => STATUS_OUT_OF_MEMORY,
+            error.UnsupportedTarget => STATUS_UNSUPPORTED_TARGET,
+        };
+        return result.status;
+    };
+    result.output = output.ptr;
+    result.output_length = output.len;
+    return STATUS_OK;
+}
+
+export fn glsl2hlsl_dxil_result_free(result: ?*DxilResult) void {
+    const value = result orelse return;
+    if (value.output) |output| allocator.free(output[0..value.output_length]);
+    value.* = .{};
+}
+
+test "DXIL C ABI owns binary results and distinguishes unsupported targets" {
+    var request: DxilOptions = .{ .program = 1, .shader_model = 65, .color = .{ 0.25, 0.5, 0.75, 1 } };
+    var result: DxilResult = undefined;
+    try std.testing.expectEqual(STATUS_OK, glsl2hlsl_dxil_emit(&request, &result));
+    try dxil.validate(result.output.?[0..result.output_length]);
+    glsl2hlsl_dxil_result_free(&result);
+    glsl2hlsl_dxil_result_free(&result);
+    try std.testing.expectEqual(@as(usize, 0), result.output_length);
+    request.shader_model = 69;
+    try std.testing.expectEqual(STATUS_UNSUPPORTED_TARGET, glsl2hlsl_dxil_emit(&request, &result));
+    try std.testing.expect(result.output == null);
+    try std.testing.expectEqual(STATUS_INVALID_ARGUMENT, glsl2hlsl_dxil_emit(null, &result));
+    try std.testing.expectEqual(STATUS_INVALID_ARGUMENT, glsl2hlsl_dxil_emit(&request, null));
+    request.shader_model = 65;
+    request.program = 99;
+    try std.testing.expectEqual(STATUS_INVALID_ARGUMENT, glsl2hlsl_dxil_emit(&request, &result));
+    request.program = 0;
+    request.shader_model = 64;
+    try std.testing.expectEqual(STATUS_INVALID_ARGUMENT, glsl2hlsl_dxil_emit(&request, &result));
 }
 
 test "C API converts a vertex shader" {

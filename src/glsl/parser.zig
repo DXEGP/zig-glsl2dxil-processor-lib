@@ -12,6 +12,9 @@ pub const Parser = struct {
     index: usize = 0,
     diagnostics: *diag.Diagnostics,
     struct_names: std.ArrayList([]const u8) = .empty,
+    expression_locations: std.AutoHashMapUnmanaged(*const ast.Expr, ast.Location) = .empty,
+    statement_locations: std.AutoHashMapUnmanaged(*const ast.Stmt, ast.Location) = .empty,
+    nesting: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, tokens: []const token.Token, diagnostics: *diag.Diagnostics) Parser {
         return .{
@@ -44,6 +47,8 @@ pub const Parser = struct {
         }
         const unit = try self.make(ast.TranslationUnit, .{
             .decls = try decls.toOwnedSlice(self.allocator),
+            .expression_locations = self.expression_locations,
+            .statement_locations = self.statement_locations,
         });
         return unit;
     }
@@ -283,6 +288,15 @@ pub const Parser = struct {
     }
 
     fn parseStatement(self: *Parser) Error!*ast.Stmt {
+        try self.enter();
+        defer self.nesting -= 1;
+        const start = self.peek();
+        const statement = try self.parseStatementInner();
+        try self.statement_locations.put(self.allocator, statement, .{ .line = start.line, .column = start.column });
+        return statement;
+    }
+
+    fn parseStatementInner(self: *Parser) Error!*ast.Stmt {
         if (self.check(.lbrace)) return self.parseCompound();
         if (self.matchIdent("if")) return self.parseIf();
         if (self.matchIdent("for")) return self.parseFor();
@@ -472,6 +486,8 @@ pub const Parser = struct {
     }
 
     fn parseAssignment(self: *Parser) Error!*ast.Expr {
+        try self.enter();
+        defer self.nesting -= 1;
         const left = try self.parseTernary();
         const op: ?ast.AssignOp = switch (self.peek().kind) {
             .equal => .assign,
@@ -565,6 +581,8 @@ pub const Parser = struct {
     }
 
     fn parseUnary(self: *Parser) Error!*ast.Expr {
+        try self.enter();
+        defer self.nesting -= 1;
         const tok = self.peek();
         const unary_op: ?ast.UnaryOp = switch (tok.kind) {
             .plus => .plus,
@@ -771,9 +789,32 @@ pub const Parser = struct {
         return error.InvalidShader;
     }
 
+    fn enter(self: *Parser) Error!void {
+        const location = self.peek();
+        if (self.nesting >= 256) return self.fail(location.line, location.column, "parser nesting exceeds resource limit", .{});
+        self.nesting += 1;
+    }
+
     fn make(self: *Parser, comptime T: type, value: T) Error!*T {
         const ptr = try self.allocator.create(T);
+        errdefer self.allocator.destroy(ptr);
         ptr.* = value;
+        if (T == ast.Expr) {
+            const location: ast.Location = switch (value) {
+                .identifier => |node| .{ .line = node.line, .column = node.column },
+                .unary => |node| .{ .line = node.line, .column = node.column },
+                .postfix => |node| .{ .line = node.line, .column = node.column },
+                .binary => |node| .{ .line = node.line, .column = node.column },
+                .assign => |node| .{ .line = node.line, .column = node.column },
+                .ternary => |node| .{ .line = node.line, .column = node.column },
+                .call => |node| .{ .line = node.line, .column = node.column },
+                .member => |node| .{ .line = node.line, .column = node.column },
+                .index => |node| .{ .line = node.line, .column = node.column },
+                .comma => |node| .{ .line = node.line, .column = node.column },
+                else => .{ .line = self.tokens[self.index -| 1].line, .column = self.tokens[self.index -| 1].column },
+            };
+            try self.expression_locations.put(self.allocator, ptr, location);
+        }
         return ptr;
     }
 

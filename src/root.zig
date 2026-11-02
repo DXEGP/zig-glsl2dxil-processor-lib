@@ -11,8 +11,12 @@ pub const builtins = @import("glsl/builtins.zig");
 pub const emitter = @import("hlsl/emitter.zig");
 pub const converter = @import("converter.zig");
 pub const capi = @import("capi.zig");
+pub const dxil = @import("dxil/container.zig");
+pub const compileGraphics = dxil.compileGraphics;
 pub const convert = converter.convert;
 
 test {
     std.testing.refAllDecls(@This());
+    std.testing.refAllDecls(dxil.graphics);
+    std.testing.refAllDecls(dxil.compat);
 }

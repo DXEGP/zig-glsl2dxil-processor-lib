@@ -75,6 +75,7 @@ zig build -Dcli=true
 - [docs/cpp-api.md](docs/cpp-api.md)：C ABI、C++ 封装、链接与内存管理
 - [docs/design.md](docs/design.md)：实现结构与设计取舍
 - [docs/glsl-hlsl-mapping.md](docs/glsl-hlsl-mapping.md)：逐项映射规则
+- [docs/dxil.md](docs/dxil.md)：纯 Zig DXIL 编译、反射、OpenGL 状态映射与硬件验收
 
 英文 README 见 [README.md](README.md)。
 
@@ -88,6 +89,10 @@ powershell -File tests/run.ps1
 ```
 
 `cpp-test` 用 `-std=c++23` 和 `-std=c++26` 分别编译并运行同一份互操作测试。`tests/run.ps1` 还会转换 `tests/shaders` 与 `examples` 下的全部着色器，并在找到 `dxc.exe` 时验证生成的 HLSL。
+
+实验性 DXIL 后端支持将配对 GLSL 顶点/片元源码直接编译为 SM 6.5 / DXIL 1.5，包含类型化标量 SSA、函数与控制流、浮点矩阵、uniform 布局反射、sampler2D 描述符表，以及可配置 OpenGL 坐标/绘制状态。Zig 使用 `compileGraphics`，C 使用 `glsl2hlsl_dxil_compile_graphics`，C++23/26 提供只移动的 `GraphicsResult`。宿主按返回的 cbuffer 偏移和步长上传 uniform。
+
+运行 `zig build test c-test cpp-test dxil-c-test dxil-source-fixtures`、`zig build dxil-source-bench -Doptimize=ReleaseSafe`，或用 `pwsh -NoProfile -File tests/dxil/run.ps1` 执行 Windows 官方校验与 GPU 回读，覆盖既有 10 个 shader 和 96 组 OpenGL 状态。核心无 DXC/LLVM 依赖；官方工具仅用于开发验收。SM 6.9、通用 GLSL/真实包兼容、UBO/SSBO、sampler 数组和局部聚合对象动态写入仍不支持；详见[支持契约](docs/dxil.md#m2glsl-源码编译与反射)。
 
 ## 限制
 

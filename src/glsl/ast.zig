@@ -1,4 +1,6 @@
+const std = @import("std");
 pub const Stage = enum { vertex, fragment };
+pub const Location = struct { line: u32, column: u32 };
 
 pub const Storage = enum { const_, in, out, inout, uniform, buffer, shared, attribute, varying };
 
@@ -77,6 +79,8 @@ pub const Decl = union(enum) {
 pub const TranslationUnit = struct {
     decls: []*Decl,
     version: ?[]const u8 = null,
+    expression_locations: std.AutoHashMapUnmanaged(*const Expr, Location) = .empty,
+    statement_locations: std.AutoHashMapUnmanaged(*const Stmt, Location) = .empty,
 };
 
 pub const Expr = union(enum) {

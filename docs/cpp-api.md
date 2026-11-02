@@ -267,3 +267,25 @@ zig build cpp-test
 ```
 
 `zig build test` 覆盖 Zig 核心与 C ABI 的转换、错误诊断和参数校验；`zig build c-test` 用 C23 编译并运行 C 互操作测试；`zig build cpp-test` 分别用 C++23 和 C++26 编译并运行同一份 C++ 互操作测试，检查头文件、链接、结果读取和错误处理。
+## DXIL 二进制发射接口
+
+M1 新增 `glsl2hlsl_dxil_emit` 与 `glsl2hlsl_dxil_result_free`，支持程序化 SM 6.5 顶点位置透传及参数化常量片元输出。结果使用 `uint8_t*` 和长度，不保证末尾零字节，需用专用函数释放。SM 6.9 暂返回 `GLSL2HLSL_STATUS_UNSUPPORTED_TARGET`（4）；旧状态编号和文本结果结构保持不变。详细参数、所有权和当前限制见 [DXIL 文档](dxil.md#c-abi)。C++ 调用方可直接使用这组 C ABI。
+
+## DXIL 配对源码接口
+
+`compile_graphics(GraphicsRequest)` 编译 VS/PS，返回只移动的 `GraphicsResult`。结果持有两份字节码、反射和诊断，析构时自动释放；`vertex()`、`fragment()`、`diagnostics()` 返回借用 span，`reflection()` 返回借用的 C 结果视图，移动或销毁所属结果后应重新取得视图。
+
+```cpp
+auto program = glsl2hlsl::compile_graphics({
+    .vertex = "layout(location=0) in vec4 p; void main(){gl_Position=p;}",
+    .fragment = "out vec4 c; void main(){c=vec4(1);}",
+    .coordinates = glsl2hlsl::Coordinates::D3D12Native
+});
+if (!program) {
+    for (const auto &diagnostic : program.diagnostics())
+        std::cerr << diagnostic.source_name << ':' << diagnostic.line
+                  << ':' << diagnostic.column << ": " << diagnostic.message << '\n';
+}
+```
+
+默认使用 `Coordinates::OpenGL`。此模式要求绑定反射中的 `GlCompat` cbuffer，并通过 `prepare_gl_state(state, prepared)` 同步设置 viewport、正面绕序和 DrawInstanced 的起始实例；详细步骤和数值契约见 [DXIL 文档](dxil.md#m2glsl-源码编译与反射)。单独创建 PSO 或仅上传 uniform 不足以完成 GL 状态映射。
