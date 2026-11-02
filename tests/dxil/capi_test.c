@@ -58,6 +58,28 @@ static int graphics_test(void) {
 }
 
 int main(void) {
+    glsl2hlsl_dxil_file files[] = {{{"color.glsl", 10}, {"#define COLOR vec4(0.25,0.5,0.75,1)\n", 35}}};
+    files[0].source.length = strlen(files[0].source.data);
+    const char *v2_vertex = "void main(){gl_Position=vec4(0,0,0,1);}";
+    const char *v2_fragment = "#include \"color.glsl\"\nout vec4 c; void main(){c=COLOR;}";
+    glsl2hlsl_dxil_graphics_options_v2 v2 = {};
+    v2.struct_size = sizeof(v2); v2.base.struct_size = sizeof(v2.base);
+    v2.base.base.vertex_source = v2_vertex; v2.base.base.vertex_source_length = strlen(v2_vertex);
+    v2.base.base.fragment_source = v2_fragment; v2.base.base.fragment_source_length = strlen(v2_fragment);
+    v2.base.base.shader_model = GLSL2HLSL_SM_6_5;
+    v2.files = files; v2.file_count = 1; v2.optimization = 1;
+    glsl2hlsl_dxil_session *session = glsl2hlsl_dxil_session_create(1, 4 * 1024 * 1024);
+    if (!session) return 1;
+    glsl2hlsl_dxil_graphics_result first = {}, second = {};
+    if (glsl2hlsl_dxil_compile_graphics_v2(session, &v2, &first) != GLSL2HLSL_STATUS_OK) return 1;
+    if (glsl2hlsl_dxil_compile_graphics_v2(session, &v2, &second) != GLSL2HLSL_STATUS_OK) return 1;
+    glsl2hlsl_dxil_cache_stats stats = {};
+    if (glsl2hlsl_dxil_session_stats(session, &stats) != GLSL2HLSL_STATUS_OK || stats.hits != 1 || stats.misses != 1) return 1;
+    glsl2hlsl_dxil_session_free(session);
+    if (first.vertex_length != second.vertex_length || memcmp(first.vertex, second.vertex, first.vertex_length)) return 1;
+    glsl2hlsl_dxil_graphics_result_free(&first); glsl2hlsl_dxil_graphics_result_free(&second);
+    v2.files = nullptr;
+    if (glsl2hlsl_dxil_compile_graphics_v2(nullptr, &v2, &first) != GLSL2HLSL_STATUS_INVALID_ARGUMENT || first.owner) return 1;
     glsl2hlsl_dxil_options options = {
         .program = GLSL2HLSL_DXIL_FRAGMENT_CONSTANT,
         .shader_model = GLSL2HLSL_SM_6_5,

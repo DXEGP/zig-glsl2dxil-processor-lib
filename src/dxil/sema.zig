@@ -56,7 +56,7 @@ pub const Global = struct {
     offset: u32 = 0,
     binding: ?u32 = null,
 };
-pub const Stage = struct { unit: *ast.TranslationUnit, globals: std.ArrayList(Global) = .empty, name: []const u8 };
+pub const Stage = struct { unit: *ast.TranslationUnit, globals: std.ArrayList(Global) = .empty, name: []const u8, mappings: []const diag.Mapping = &.{} };
 pub const Uniform = struct { name: []const u8, typ: Type, offset: u32, size: u32, array_stride: u32, matrix_stride: u32, stages: u32 };
 pub const Binding = struct { name: []const u8, class: @FieldType(ir.Resource, "class"), binding: u32, space: u32 = 0, size: u32 = 0, stages: u32 };
 
@@ -145,6 +145,7 @@ pub const Program = struct {
     pub fn context(self: *Program, stage_index: usize) void {
         self.diagnostics.stage = if (stage_index == 0) .vertex else .fragment;
         self.diagnostics.source_name = self.stages[stage_index].name;
+        self.diagnostics.mappings = self.stages[stage_index].mappings;
     }
 
     pub fn resolveType(self: *Program, stage_index: usize, name: ast.TypeName) Error!Type {

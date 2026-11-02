@@ -73,6 +73,25 @@ pub fn build(b: *std.Build) void {
     source_bench_run.setCwd(b.path("."));
     b.step("dxil-source-bench", "Measure uncached paired GLSL compilation and requested memory").dependOn(&source_bench_run.step);
 
+    const m4 = b.addExecutable(.{ .name = "dxil-m4", .root_module = b.createModule(.{
+        .root_source_file = b.path("tests/dxil/m4.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "processor", .module = mod }},
+    }) });
+    const m4_run = b.addRunArtifact(m4);
+    m4_run.setCwd(b.path("."));
+    b.step("dxil-m4", "Audit pinned Minecraft and local Iris packages without modifying sources").dependOn(&m4_run.step);
+    const m4_bench = b.addExecutable(.{ .name = "dxil-m4-bench", .root_module = b.createModule(.{
+        .root_source_file = b.path("tests/dxil/m4_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "processor", .module = mod }},
+    }) });
+    const m4_bench_run = b.addRunArtifact(m4_bench);
+    m4_bench_run.setCwd(b.path("."));
+    b.step("dxil-m4-bench", "Measure real and scaled input compilation, safe optimization and cache separately").dependOn(&m4_bench_run.step);
+
     if (with_cli) {
         const exe = b.addExecutable(.{
             .name = "glsl2hlsl",

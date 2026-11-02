@@ -247,6 +247,35 @@ typedef struct glsl2hlsl_dxil_graphics_options_ex {
     uint32_t sampler_heap_base;
 } glsl2hlsl_dxil_graphics_options_ex;
 
+typedef struct glsl2hlsl_dxil_text { const char *data; size_t length; } glsl2hlsl_dxil_text;
+typedef struct glsl2hlsl_dxil_file { glsl2hlsl_dxil_text name, source; } glsl2hlsl_dxil_file;
+typedef struct glsl2hlsl_dxil_define { glsl2hlsl_dxil_text name, value; } glsl2hlsl_dxil_define;
+typedef struct glsl2hlsl_dxil_limits {
+    size_t file_bytes, input_bytes, output_bytes, tokens, expansions;
+    uint32_t include_depth, macro_depth, condition_depth, expression_depth;
+} glsl2hlsl_dxil_limits;
+typedef struct glsl2hlsl_dxil_graphics_options_v2 {
+    size_t struct_size;
+    glsl2hlsl_dxil_graphics_options_ex base;
+    const glsl2hlsl_dxil_file *files;
+    size_t file_count;
+    const glsl2hlsl_dxil_define *defines;
+    size_t define_count;
+    const glsl2hlsl_dxil_text *include_dirs;
+    size_t include_dir_count;
+    const glsl2hlsl_dxil_limits *limits;
+    uint32_t optimization;
+} glsl2hlsl_dxil_graphics_options_v2;
+typedef struct glsl2hlsl_dxil_session glsl2hlsl_dxil_session;
+typedef struct glsl2hlsl_dxil_cache_stats { size_t hits, misses, evictions, bytes; } glsl2hlsl_dxil_cache_stats;
+[[nodiscard]] GLSL2HLSL_API glsl2hlsl_status glsl2hlsl_dxil_compile_graphics_v2(
+    glsl2hlsl_dxil_session *session, const glsl2hlsl_dxil_graphics_options_v2 *options,
+    glsl2hlsl_dxil_graphics_result *result);
+[[nodiscard]] GLSL2HLSL_API glsl2hlsl_dxil_session *glsl2hlsl_dxil_session_create(size_t entries, size_t bytes);
+GLSL2HLSL_API void glsl2hlsl_dxil_session_free(glsl2hlsl_dxil_session *session);
+[[nodiscard]] GLSL2HLSL_API glsl2hlsl_status glsl2hlsl_dxil_session_stats(
+    const glsl2hlsl_dxil_session *session, glsl2hlsl_dxil_cache_stats *stats);
+
 typedef struct glsl2hlsl_dxil_heap_binding {
     uint32_t binding_index;
     uint32_t heap_index;

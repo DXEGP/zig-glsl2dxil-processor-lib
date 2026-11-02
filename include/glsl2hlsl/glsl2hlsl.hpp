@@ -140,6 +140,33 @@ struct GraphicsRequest {
     BindingMode binding_mode = BindingMode::DescriptorTables;
     std::uint32_t resource_heap_base = 0;
     std::uint32_t sampler_heap_base = 0;
+    std::span<const glsl2hlsl_dxil_file> files{};
+    std::span<const glsl2hlsl_dxil_define> defines{};
+    std::span<const glsl2hlsl_dxil_text> include_dirs{};
+    const glsl2hlsl_dxil_limits *limits = nullptr;
+    bool optimize = false;
+    glsl2hlsl_dxil_session *session = nullptr;
+};
+
+class CompileSession {
+    glsl2hlsl_dxil_session *value_;
+public:
+    explicit CompileSession(std::size_t entries = 32, std::size_t bytes = 64 * 1024 * 1024) noexcept
+        : value_(glsl2hlsl_dxil_session_create(entries, bytes)) {}
+    CompileSession(const CompileSession &) = delete;
+    CompileSession &operator=(const CompileSession &) = delete;
+    CompileSession(CompileSession &&other) noexcept : value_(std::exchange(other.value_, nullptr)) {}
+    CompileSession &operator=(CompileSession &&other) noexcept {
+        if (this != &other) { glsl2hlsl_dxil_session_free(value_); value_ = std::exchange(other.value_, nullptr); }
+        return *this;
+    }
+    ~CompileSession() { glsl2hlsl_dxil_session_free(value_); }
+    [[nodiscard]] glsl2hlsl_dxil_session *get() const noexcept { return value_; }
+    [[nodiscard]] glsl2hlsl_dxil_cache_stats stats() const noexcept {
+        glsl2hlsl_dxil_cache_stats stats{};
+        if (glsl2hlsl_dxil_session_stats(value_, &stats) != GLSL2HLSL_STATUS_OK) return {};
+        return stats;
+    }
 };
 
 class GraphicsResult {
@@ -194,7 +221,14 @@ public:
     extended.binding_mode = static_cast<glsl2hlsl_dxil_binding_mode>(std::to_underlying(request.binding_mode));
     extended.resource_heap_base = request.resource_heap_base;
     extended.sampler_heap_base = request.sampler_heap_base;
-    result.value_.status = glsl2hlsl_dxil_compile_graphics_ex(&extended, &result.value_);
+    glsl2hlsl_dxil_graphics_options_v2 versioned{};
+    versioned.struct_size = sizeof(versioned);
+    versioned.base = extended;
+    versioned.files = request.files.data(); versioned.file_count = request.files.size();
+    versioned.defines = request.defines.data(); versioned.define_count = request.defines.size();
+    versioned.include_dirs = request.include_dirs.data(); versioned.include_dir_count = request.include_dirs.size();
+    versioned.limits = request.limits; versioned.optimization = request.optimize ? 1 : 0;
+    result.value_.status = glsl2hlsl_dxil_compile_graphics_v2(request.session, &versioned, &result.value_);
     return result;
 }
 

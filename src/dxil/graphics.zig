@@ -1,5 +1,5 @@
 const std = @import("std");
-const preprocess = @import("../glsl/preprocess.zig");
+pub const preprocessing = @import("../glsl/source.zig");
 const token = @import("../glsl/token.zig");
 const parser = @import("../glsl/parser.zig");
 const ast = @import("../glsl/ast.zig");
@@ -9,6 +9,7 @@ const sema = @import("sema.zig");
 const Lowerer = @import("lower.zig").Lowerer;
 const ir = @import("ir.zig");
 pub const targets = @import("target.zig");
+pub const optimizer = @import("optimize.zig");
 
 pub const Coordinates = enum { opengl, d3d12_native };
 pub const Source = struct { source: []const u8, name: []const u8 = "" };
@@ -18,6 +19,10 @@ pub const Measurement = struct {
     semantics_ns: u64 = 0,
     lower_ns: u64 = 0,
     emit_ns: u64 = 0,
+    preprocess_ns: u64 = 0,
+    parse_ns: u64 = 0,
+    optimize_ns: u64 = 0,
+    preprocessed_tokens: usize = 0,
 };
 const Lap = struct {
     measurement: ?*Measurement,
@@ -42,6 +47,8 @@ pub const GraphicsRequest = struct {
     measurement: ?*Measurement = null,
     binding_mode: targets.BindingMode = .descriptor_tables,
     heap_layout: targets.HeapLayout = .{},
+    preprocessing: preprocessing.Config = .{},
+    optimization: optimizer.Level = .none,
 };
 pub const Reflection = struct {
     schema_version: u32 = 1,
@@ -62,9 +69,29 @@ pub const GraphicsResult = struct {
     vertex: []const u8,
     fragment: []const u8,
     reflection: Reflection,
+    dependencies: []const preprocessing.Dependency,
+    storage: ?*Storage = null,
+
+    pub const Storage = struct { allocator: std.mem.Allocator, arena: std.heap.ArenaAllocator, references: usize = 1 };
+
+    pub fn retain(self: *GraphicsResult, allocator: std.mem.Allocator) error{OutOfMemory}!GraphicsResult {
+        if (self.storage == null) {
+            const storage = try allocator.create(Storage);
+            storage.* = .{ .allocator = allocator, .arena = self.arena };
+            self.storage = storage;
+        }
+        self.storage.?.references += 1;
+        return self.*;
+    }
 
     pub fn deinit(self: *GraphicsResult) void {
-        self.arena.deinit();
+        if (self.storage) |storage| {
+            storage.references -= 1;
+            if (storage.references == 0) {
+                storage.arena.deinit();
+                storage.allocator.destroy(storage);
+            }
+        } else self.arena.deinit();
         self.* = undefined;
     }
 };
@@ -79,23 +106,43 @@ pub fn compileGraphics(allocator: std.mem.Allocator, request: GraphicsRequest, d
     const previous_stage = diagnostics.stage;
     const previous_source = diagnostics.source_name;
     const previous_code = diagnostics.code;
+    const previous_map = diagnostics.mappings;
     defer {
         diagnostics.stage = previous_stage;
         diagnostics.source_name = previous_source;
         diagnostics.code = previous_code;
+        diagnostics.mappings = previous_map;
     }
     var units: [2]*ast.TranslationUnit = undefined;
     const sources = [_]Source{ request.vertex, request.fragment };
     var names: [2][]const u8 = undefined;
+    var maps: [2][]const diag.Mapping = undefined;
+    var dependencies: std.ArrayList(preprocessing.Dependency) = .empty;
+    if (request.measurement) |measurement| {
+        measurement.preprocess_ns = 0;
+        measurement.parse_ns = 0;
+        measurement.preprocessed_tokens = 0;
+    }
     for (sources, &units, &names, 0..) |source, *unit, *name, index| {
         diagnostics.stage = if (index == 0) .vertex else .fragment;
         name.* = try diagnostics.allocator.dupe(u8, if (source.name.len == 0) (if (index == 0) "vertex" else "fragment") else source.name);
         diagnostics.source_name = name.*;
+        diagnostics.mappings = &.{};
         if (source.source.len > 1024 * 1024) {
             try diagnostics.err(1, 1, "source exceeds 1 MiB resource limit");
             return error.InvalidShader;
         }
-        const preprocessed = try preprocess.preprocess(scratch, source.source, diagnostics);
+        var frontend_lap = Lap.start(request.measurement);
+        const preprocessed = try preprocessing.preprocess(scratch, .{ .source = source.source, .name = name.* }, request.preprocessing, diagnostics);
+        if (request.measurement) |measurement| {
+            const before = measurement.preprocess_ns;
+            frontend_lap.finish("preprocess_ns");
+            measurement.preprocess_ns += before;
+            measurement.preprocessed_tokens += preprocessed.token_count;
+        }
+        try dependencies.appendSlice(scratch, preprocessed.dependencies);
+        maps[index] = preprocessed.mappings;
+        diagnostics.mappings = maps[index];
         const tokens = try token.tokenize(scratch, preprocessed.source, diagnostics);
         if (tokens.len > 262144) {
             try diagnostics.err(1, 1, "source exceeds token resource limit");
@@ -103,9 +150,14 @@ pub fn compileGraphics(allocator: std.mem.Allocator, request: GraphicsRequest, d
         }
         var shader_parser = parser.Parser.init(scratch, tokens, diagnostics);
         unit.* = try shader_parser.parse();
+        if (request.measurement) |measurement| {
+            const before = measurement.parse_ns;
+            frontend_lap.finish("parse_ns");
+            measurement.parse_ns += before;
+        }
     }
     lap.finish("frontend_ns");
-    var program: sema.Program = .{ .allocator = scratch, .diagnostics = diagnostics, .stages = .{ .{ .unit = units[0], .name = names[0] }, .{ .unit = units[1], .name = names[1] } }, .opengl = request.coordinates == .opengl };
+    var program: sema.Program = .{ .allocator = scratch, .diagnostics = diagnostics, .stages = .{ .{ .unit = units[0], .name = names[0], .mappings = maps[0] }, .{ .unit = units[1], .name = names[1], .mappings = maps[1] } }, .opengl = request.coordinates == .opengl };
     try program.analyze();
     const heap_bindings = try scratch.alloc(targets.HeapBinding, if (request.binding_mode == .direct_heap) program.bindings.items.len else 0);
     var resource_index: u64 = request.heap_layout.resource_base;
@@ -139,6 +191,12 @@ pub fn compileGraphics(allocator: std.mem.Allocator, request: GraphicsRequest, d
     fragment_lowerer.binding_mode = request.binding_mode;
     fragment_lowerer.heap_bindings = heap_bindings;
     var fragment = try fragment_lowerer.lower();
+    lap.finish("lower_ns");
+    if (request.optimization == .safe) {
+        optimizer.optimize(&vertex) catch |err| return backendError(diagnostics, err);
+        optimizer.optimize(&fragment) catch |err| return backendError(diagnostics, err);
+    }
+    lap.finish("optimize_ns");
     if (request.binding_mode == .direct_heap) {
         vertex.resources.clearRetainingCapacity();
         fragment.resources.clearRetainingCapacity();
@@ -150,11 +208,10 @@ pub fn compileGraphics(allocator: std.mem.Allocator, request: GraphicsRequest, d
     requirements.root_signature_version = @max(requirements.root_signature_version, fragment_requirements.root_signature_version);
     requirements.resource_binding_tier = @max(requirements.resource_binding_tier, fragment_requirements.resource_binding_tier);
     requirements.native_vectors = requirements.native_vectors or fragment_requirements.native_vectors;
-    lap.finish("lower_ns");
     const vertex_bytes = container.emitModule(scratch, &vertex, request.target) catch |err| return backendError(diagnostics, err);
     const fragment_bytes = container.emitModule(scratch, &fragment, request.target) catch |err| return backendError(diagnostics, err);
     lap.finish("emit_ns");
-    return .{ .arena = arena, .vertex = vertex_bytes, .fragment = fragment_bytes, .reflection = .{
+    return .{ .arena = arena, .vertex = vertex_bytes, .fragment = fragment_bytes, .dependencies = dependencies.items, .reflection = .{
         .coordinates = request.coordinates,
         .uniforms = program.uniforms.items,
         .bindings = program.bindings.items,
@@ -261,23 +318,76 @@ test "uniform packing and stage linkage remain deterministic" {
     }
 }
 
-fn allocationTrial(allocator: std.mem.Allocator, target: container.Target, binding_mode: targets.BindingMode) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
+fn allocationTrial(allocator: std.mem.Allocator, target: container.Target, binding_mode: targets.BindingMode, production: bool) !void {
+    var backing = allocator;
+    const adapter = struct {
+        fn alloc(context: *anyopaque, length: usize, alignment: std.mem.Alignment, address: usize) ?[*]u8 {
+            const value: *std.mem.Allocator = @ptrCast(@alignCast(context));
+            return value.rawAlloc(length, alignment, address);
+        }
+        fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, address: usize) void {
+            const value: *std.mem.Allocator = @ptrCast(@alignCast(context));
+            value.rawFree(memory, alignment, address);
+        }
+    };
+    const deterministic: std.mem.Allocator = .{ .ptr = &backing, .vtable = &.{ .alloc = adapter.alloc, .free = adapter.free, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap } };
+    var arena = std.heap.ArenaAllocator.init(deterministic);
     defer arena.deinit();
     var diagnostics = diag.Diagnostics.init(arena.allocator());
-    var result = try compileGraphics(allocator, .{
+    var session = @import("cache.zig").Session.init(deterministic, .{});
+    defer session.deinit();
+    const request: GraphicsRequest = .{
         .vertex = .{ .source = "layout(location=0) in vec4 p; out vec2 uv; void main(){gl_Position=p;uv=p.xy;}" },
         .fragment = .{ .source = "in vec2 uv; uniform float w[2]; out vec4 c; void main(){float x=0;for(int i=0;i<2;i++){x+=w[i];}c=vec4(uv,x,1);}" },
         .target = target,
         .binding_mode = binding_mode,
-    }, &diagnostics);
+        .preprocessing = if (production) .{ .files = &.{.{ .name = "test", .source = "#define F(x) x\n" }} } else .{},
+        .optimization = if (production) .safe else .none,
+    };
+    var result = if (production) try session.compile(request, &diagnostics) else try compileGraphics(deterministic, request, &diagnostics);
     defer result.deinit();
+    if (production) {
+        var hit = try session.compile(request, &diagnostics);
+        defer hit.deinit();
+    }
 }
 
 test "paired source compilation releases all allocations on failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationTrial, .{ container.Target.sm65, targets.BindingMode.descriptor_tables });
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationTrial, .{ container.Target.sm69, targets.BindingMode.descriptor_tables });
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationTrial, .{ container.Target.sm69, targets.BindingMode.direct_heap });
+    for ([_]bool{ false, true }) |production| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationTrial, .{ container.Target.sm65, targets.BindingMode.descriptor_tables, production });
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationTrial, .{ container.Target.sm69, targets.BindingMode.descriptor_tables, production });
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationTrial, .{ container.Target.sm69, targets.BindingMode.direct_heap, production });
+    }
+}
+
+test "included semantic errors retain file and invocation location after temporary memory is freed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diagnostics = diag.Diagnostics.init(arena.allocator());
+    try std.testing.expectError(error.InvalidShader, compileGraphics(std.testing.allocator, .{
+        .vertex = .{ .source = "void main(){gl_Position=vec4(0,0,0,1);}" },
+        .fragment = .{ .name = "main.frag", .source = "#include \"lib/body.glsl\"\n" },
+        .preprocessing = .{ .files = &.{.{ .name = "lib/body.glsl", .source = "#define BAD missing_name\nout vec4 c;\nvoid main(){\n c=vec4(BAD);\n}\n" }} },
+    }, &diagnostics));
+    const failure = diagnostics.items.items[diagnostics.items.items.len - 1];
+    try std.testing.expectEqualStrings("lib/body.glsl", failure.source_name);
+    try std.testing.expectEqual(@as(u32, 4), failure.line);
+    try std.testing.expectEqual(@as(u32, 9), failure.column);
+}
+
+test "safe CSE reduces captured arithmetic without changing interfaces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diagnostics = diag.Diagnostics.init(arena.allocator());
+    var request: GraphicsRequest = .{ .vertex = .{ .source = "in vec4 p;void main(){gl_Position=p;}" }, .fragment = .{ .source = "uniform float a;out vec4 c;void main(){float v=a;c=vec4(v*v+v*v+v*v+v*v);}" }, .coordinates = .d3d12_native };
+    var baseline = try compileGraphics(std.testing.allocator, request, &diagnostics);
+    defer baseline.deinit();
+    request.optimization = .safe;
+    var optimized = try compileGraphics(std.testing.allocator, request, &diagnostics);
+    defer optimized.deinit();
+    try std.testing.expect(optimized.fragment.len < baseline.fragment.len);
+    try std.testing.expectEqual(baseline.reflection.uniforms[0].offset, optimized.reflection.uniforms[0].offset);
+    try std.testing.expectEqual(baseline.reflection.fragment_outputs[0].index, optimized.reflection.fragment_outputs[0].index);
 }
 
 test "SM6.9 preserves uniform layouts and signatures and reports heap requirements" {

@@ -200,6 +200,8 @@ GL 验收矩阵为 2 origins × 2 clip depths × 3 depth ranges × 2 windings ×
 
 重跑报告为 `zig-out/dxil/report.json`，明细日志为 `source-validation.txt`、`source-render.txt`、`reference-source-render.txt` 和 `source-benchmark.txt`。生成物随适配器数量与语料增加而变化，不能把 74 当固定覆盖率要求。
 
+M4 的内存输入、宏、缓存和真实包边界见 [M4 契约](m4.md)，以下保留 M2/M3 当时的验收记录。
+
 ## M3：SM 6.9 合法化与宿主要求
 
 `target.zig` 集中管理目标与执行要求。SM 6.5 保持标量化与传统 `createHandle`；SM 6.9 使用 DXIL/validator 1.9、PSV v3（52 字节 RuntimeInfo、24 字节资源记录、入口名称），把描述符表句柄改写为 `createHandleFromBinding` + `annotateHandle`。`SFI0` 与入口 shader flags 按实际使用的堆生成，默认描述符表不会要求直接索引标志。

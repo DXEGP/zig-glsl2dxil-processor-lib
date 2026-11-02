@@ -5,6 +5,19 @@ const options = @import("options.zig");
 const dxil = @import("dxil/container.zig");
 const graphics_capi = @import("dxil/capi.zig");
 
+export fn glsl2hlsl_dxil_compile_graphics_v2(session: ?*graphics_capi.Session, request: ?*const graphics_capi.OptionsV2, result: ?*graphics_capi.Result) c_int {
+    return graphics_capi.compileV2(session, request, result);
+}
+export fn glsl2hlsl_dxil_session_create(entries: usize, bytes: usize) ?*graphics_capi.Session {
+    return graphics_capi.sessionCreate(entries, bytes);
+}
+export fn glsl2hlsl_dxil_session_free(session: ?*graphics_capi.Session) void {
+    graphics_capi.sessionFree(session);
+}
+export fn glsl2hlsl_dxil_session_stats(session: ?*const graphics_capi.Session, stats: ?*graphics_capi.CacheStats) c_int {
+    return graphics_capi.sessionStats(session, stats);
+}
+
 export fn glsl2hlsl_dxil_compile_graphics(request: ?*const graphics_capi.Options, result: ?*graphics_capi.Result) c_int {
     return graphics_capi.compile(request, result);
 }

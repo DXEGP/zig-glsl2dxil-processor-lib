@@ -62,6 +62,103 @@ pub const Result = extern struct {
     diagnostic_count: usize = 0,
 };
 const Owner = struct { arena: std.heap.ArenaAllocator, result: ?graphics.GraphicsResult = null, execution: ExecutionInfo = .{} };
+pub const Text = extern struct { data: ?[*]const u8, length: usize };
+pub const File = extern struct { name: Text, source: Text };
+pub const Define = extern struct { name: Text, value: Text };
+pub const Limits = extern struct {
+    file_bytes: usize,
+    input_bytes: usize,
+    output_bytes: usize,
+    tokens: usize,
+    expansions: usize,
+    include_depth: u32,
+    macro_depth: u32,
+    condition_depth: u32,
+    expression_depth: u32,
+};
+pub const OptionsV2 = extern struct {
+    struct_size: usize,
+    base: OptionsEx,
+    files: ?[*]const File,
+    file_count: usize,
+    defines: ?[*]const Define,
+    define_count: usize,
+    include_dirs: ?[*]const Text,
+    include_dir_count: usize,
+    limits: ?*const Limits,
+    optimization: u32,
+};
+pub const Session = @import("cache.zig").Session;
+pub const CacheStats = extern struct { hits: usize, misses: usize, evictions: usize, bytes: usize };
+
+pub fn sessionCreate(entries: usize, bytes: usize) ?*Session {
+    const session = allocator.create(Session) catch return null;
+    session.* = Session.init(allocator, .{ .entries = entries, .bytes = bytes });
+    return session;
+}
+pub fn sessionFree(session: ?*Session) void {
+    if (session) |value| {
+        value.deinit();
+        allocator.destroy(value);
+    }
+}
+pub fn sessionStats(session: ?*const Session, output: ?*CacheStats) c_int {
+    const destination = output orelse return 3;
+    destination.* = std.mem.zeroes(CacheStats);
+    const value = session orelse return 3;
+    destination.* = .{ .hits = value.stats.hits, .misses = value.stats.misses, .evictions = value.stats.evictions, .bytes = value.stats.bytes };
+    return 0;
+}
+fn validText(value: Text) bool {
+    return value.data != null or value.length == 0;
+}
+pub fn compileV2(session: ?*Session, request: ?*const OptionsV2, out_result: ?*Result) c_int {
+    const result = out_result orelse return 3;
+    result.* = .{};
+    const options = request orelse {
+        result.status = 3;
+        return 3;
+    };
+    if (options.struct_size != @sizeOf(OptionsV2) or options.base.struct_size != @sizeOf(OptionsEx) or options.base.binding_mode > 1 or options.optimization > 1 or
+        (options.files == null and options.file_count != 0) or (options.defines == null and options.define_count != 0) or (options.include_dirs == null and options.include_dir_count != 0))
+    {
+        result.status = 3;
+        return 3;
+    }
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const files = scratch.alloc(graphics.preprocessing.File, options.file_count) catch return outOfMemory(result);
+    for (files, 0..) |*destination, index| {
+        const source = options.files.?[index];
+        if (!validText(source.name) or !validText(source.source)) {
+            result.status = 3;
+            return 3;
+        }
+        destination.* = .{ .name = slice(source.name.data, source.name.length), .source = slice(source.source.data, source.source.length) };
+    }
+    const defines = scratch.alloc(graphics.preprocessing.Define, options.define_count) catch return outOfMemory(result);
+    for (defines, 0..) |*destination, index| {
+        const source = options.defines.?[index];
+        if (!validText(source.name) or !validText(source.value)) {
+            result.status = 3;
+            return 3;
+        }
+        destination.* = .{ .name = slice(source.name.data, source.name.length), .value = slice(source.value.data, source.value.length) };
+    }
+    const directories = scratch.alloc([]const u8, options.include_dir_count) catch return outOfMemory(result);
+    for (directories, 0..) |*destination, index| {
+        const source = options.include_dirs.?[index];
+        if (!validText(source)) {
+            result.status = 3;
+            return 3;
+        }
+        destination.* = slice(source.data, source.length);
+    }
+    var limits: graphics.preprocessing.Limits = .{};
+    if (options.limits) |value| limits = .{ .file_bytes = value.file_bytes, .input_bytes = value.input_bytes, .output_bytes = value.output_bytes, .tokens = value.tokens, .expansions = value.expansions, .include_depth = value.include_depth, .macro_depth = value.macro_depth, .condition_depth = value.condition_depth, .expression_depth = value.expression_depth };
+    return compileImpl(&options.base.base, result, if (options.base.binding_mode == 0) .descriptor_tables else .direct_heap, .{ .resource_base = options.base.resource_heap_base, .sampler_base = options.base.sampler_heap_base }, .{ .files = files, .defines = defines, .include_dirs = directories, .limits = limits }, if (options.optimization == 0) .none else .safe, session);
+}
 
 pub fn free(result: ?*Result) void {
     const value = result orelse return;
@@ -87,7 +184,7 @@ fn convertType(typ: sema.Type) Type {
 }
 
 pub fn compile(request: ?*const Options, out_result: ?*Result) c_int {
-    return compileImpl(request, out_result, .descriptor_tables, .{});
+    return compileImpl(request, out_result, .descriptor_tables, .{}, .{}, .none, null);
 }
 
 pub fn compileEx(request: ?*const OptionsEx, out_result: ?*Result) c_int {
@@ -101,7 +198,7 @@ pub fn compileEx(request: ?*const OptionsEx, out_result: ?*Result) c_int {
         result.status = 3;
         return 3;
     }
-    return compileImpl(&options.base, result, if (options.binding_mode == 0) .descriptor_tables else .direct_heap, .{ .resource_base = options.resource_heap_base, .sampler_base = options.sampler_heap_base });
+    return compileImpl(&options.base, result, if (options.binding_mode == 0) .descriptor_tables else .direct_heap, .{ .resource_base = options.resource_heap_base, .sampler_base = options.sampler_heap_base }, .{}, .none, null);
 }
 
 pub fn executionInfo(result: ?*const Result, output: ?*ExecutionInfo) c_int {
@@ -114,7 +211,7 @@ pub fn executionInfo(result: ?*const Result, output: ?*ExecutionInfo) c_int {
     return 0;
 }
 
-fn compileImpl(request: ?*const Options, out_result: ?*Result, binding_mode: graphics.targets.BindingMode, heap_layout: graphics.targets.HeapLayout) c_int {
+fn compileImpl(request: ?*const Options, out_result: ?*Result, binding_mode: graphics.targets.BindingMode, heap_layout: graphics.targets.HeapLayout, preprocessing: graphics.preprocessing.Config, optimization: graphics.optimizer.Level, session: ?*Session) c_int {
     const result = out_result orelse return 3;
     result.* = .{};
     const options = request orelse {
@@ -130,14 +227,17 @@ fn compileImpl(request: ?*const Options, out_result: ?*Result, binding_mode: gra
     result.owner = owner;
     const scratch = owner.arena.allocator();
     var diagnostics = diag.Diagnostics.init(scratch);
-    owner.result = graphics.compileGraphics(allocator, .{
+    const compile_request: graphics.GraphicsRequest = .{
         .vertex = .{ .source = slice(options.vertex_source, options.vertex_source_length), .name = slice(options.vertex_name, options.vertex_name_length) },
         .fragment = .{ .source = slice(options.fragment_source, options.fragment_source_length), .name = slice(options.fragment_name, options.fragment_name_length) },
         .coordinates = if (options.coordinates == 0) .opengl else .d3d12_native,
         .target = if (options.shader_model == 65) .sm65 else .sm69,
         .binding_mode = binding_mode,
         .heap_layout = heap_layout,
-    }, &diagnostics) catch |err| switch (err) {
+        .preprocessing = preprocessing,
+        .optimization = optimization,
+    };
+    owner.result = (if (session) |value| value.compile(compile_request, &diagnostics) else graphics.compileGraphics(allocator, compile_request, &diagnostics)) catch |err| switch (err) {
         error.OutOfMemory => return outOfMemory(result),
         error.UnsupportedTarget => {
             free(result);

@@ -85,14 +85,22 @@ int main(int argc, char **argv) {
             std::uint32_t count;
             std::memcpy(&count, bytes.data() + 28, 4);
             bool mutated = false;
+            bool empty_signature = false;
             for (std::uint32_t part = 0; part < count; ++part) {
                 std::uint32_t offset;
                 std::memcpy(&offset, bytes.data() + 32 + part * 4, 4);
                 if (std::memcmp(bytes.data() + offset, "OSG1", 4) == 0) {
+                    std::uint32_t signature_count;
+                    std::memcpy(&signature_count, bytes.data() + offset + 8, 4);
+                    if (!signature_count) { empty_signature = true; break; }
                     bytes[offset + 8 + 8 + 16] = 2;
                     mutated = true;
                     break;
                 }
+            }
+            if (empty_signature) {
+                std::cout << "signature corruption not applicable: empty output signature\n";
+                continue;
             }
             if (mutated) {
                 BYTE digest[16];

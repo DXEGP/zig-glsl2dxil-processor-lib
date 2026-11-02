@@ -3,12 +3,12 @@ const processor = @import("processor");
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 
-const Counter = struct {
+pub const Counter = struct {
     backing: Allocator,
     live: usize = 0,
     peak: usize = 0,
 
-    fn allocator(self: *Counter) Allocator {
+    pub fn allocator(self: *Counter) Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
     }
     fn alloc(context: *anyopaque, length: usize, alignment: Alignment, address: usize) ?[*]u8 {

@@ -4,6 +4,7 @@ pub const diag = @import("diag.zig");
 pub const options = @import("options.zig");
 pub const token = @import("glsl/token.zig");
 pub const preprocess = @import("glsl/preprocess.zig");
+pub const source = @import("glsl/source.zig");
 pub const ast = @import("glsl/ast.zig");
 pub const types = @import("glsl/types.zig");
 pub const parser = @import("glsl/parser.zig");
@@ -13,6 +14,7 @@ pub const converter = @import("converter.zig");
 pub const capi = @import("capi.zig");
 pub const dxil = @import("dxil/container.zig");
 pub const compileGraphics = dxil.compileGraphics;
+pub const CompileSession = @import("dxil/cache.zig").Session;
 pub const convert = converter.convert;
 
 test {

@@ -78,6 +78,7 @@ Detailed documentation is currently in Chinese:
 - [docs/design.md](docs/design.md): implementation and design decisions
 - [docs/glsl-hlsl-mapping.md](docs/glsl-hlsl-mapping.md): GLSL-to-HLSL mapping rules
 - [docs/dxil.md](docs/dxil.md): pure Zig DXIL compilation, reflection, OpenGL state mapping, and hardware acceptance
+- [docs/m4.md](docs/m4.md): memory VFS/macros, bounded sessions, Minecraft/Iris support matrix, and reproducible benchmarks
 
 See [README_zh.md](README_zh.md) for this README in Chinese.
 
@@ -97,5 +98,7 @@ The experimental DXIL backend compiles paired GLSL vertex/pixel sources directly
 Run `zig build test c-test cpp-test dxil-c-test dxil-source-fixtures`, `zig build dxil-source-bench -Doptimize=ReleaseSafe`, or `pwsh -NoProfile -File tests/dxil/run.ps1` for Windows validator and hardware acceptance, including the existing 10 shaders and 96 OpenGL state combinations. The script compares layouts, interfaces, pixels and depth across both targets and both SM 6.9 binding modes; it downloads a pinned Agility SDK for the test renderer and requires SM 6.9 hardware for full acceptance. The compiler core has no DXC/LLVM dependency; official tools are used only during development. General GLSL/package compatibility, UBO/SSBO, sampler arrays, nonuniform resource indexing, and dynamic writes to local aggregates remain unsupported; see the [support contract](docs/dxil.md#m2glsl-源码编译与反射) and [SM 6.9 host requirements](docs/dxil.md#m3sm-69-合法化与宿主要求).
 
 ## Limitations
+
+The DXIL v2 request adds memory includes, function macros, source mappings, explicit bounded cache sessions and optional safe optimization, preserving existing C ABI layouts. C++ exposes `CompileSession` and additional `GraphicsRequest` fields. Run `pwsh -NoProfile -File tests/dxil/m4.ps1` with the two supplied archives under `example_shaderpack/` for pinned Minecraft 1.21.4 and Iris checks. Currently 28/34 same-stem Minecraft VS/PS pairs compile; iterationRP's 11 passing pairs are discard/no-op stages, and Complementary's 108 pairs remain blocked. See the [M4 contract](docs/m4.md) for inputs, limits, ownership, performance and remaining work; this does not provide whole-game or whole-pack compatibility.
 
 Stage 1 does not support UBO/SSBO blocks, geometry/tessellation/compute shaders, function overloading, dynamic matrix indexing, or image atomics. See the "Unsupported features" section of the mapping document for the full list.

@@ -166,7 +166,7 @@ fn psv(allocator: std.mem.Allocator, shader: *const ir.Module, analysis: encode.
     try buffer.append(strings.data.items);
     try buffer.word(@intCast(indices.items.len));
     for (indices.items) |index| try buffer.word(index);
-    try buffer.word(16);
+    if (analysis.inputs.len + analysis.outputs.len != 0) try buffer.word(16);
     var element_index: usize = 0;
     for ([_][]const ir.Signature{ analysis.inputs, analysis.outputs }) |elements| for (elements) |element| {
         try psvElement(&buffer, name_offsets.items[element_index], @intCast(element_index), element);

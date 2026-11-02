@@ -76,6 +76,7 @@ zig build -Dcli=true
 - [docs/design.md](docs/design.md)：实现结构与设计取舍
 - [docs/glsl-hlsl-mapping.md](docs/glsl-hlsl-mapping.md)：逐项映射规则
 - [docs/dxil.md](docs/dxil.md)：纯 Zig DXIL 编译、反射、OpenGL 状态映射与硬件验收
+- [docs/m4.md](docs/m4.md)：内存 VFS／宏、有界会话、Minecraft/Iris 支持清单与可复现基准
 
 英文 README 见 [README.md](README.md)。
 
@@ -95,5 +96,7 @@ powershell -File tests/run.ps1
 运行 `zig build test c-test cpp-test dxil-c-test dxil-source-fixtures`、`zig build dxil-source-bench -Doptimize=ReleaseSafe`，或用 `pwsh -NoProfile -File tests/dxil/run.ps1` 执行 Windows 官方校验与 GPU 回读，覆盖既有 10 个 shader 和 96 组 OpenGL 状态。脚本比较两个目标及 SM 6.9 两种绑定方式的布局、接口、像素与深度，为测试渲染器下载固定版本的 Agility SDK，完整验收需要 SM 6.9 硬件。核心无 DXC/LLVM 依赖；官方工具仅用于开发验收。通用 GLSL/真实包兼容、UBO/SSBO、sampler 数组、非一致资源索引和局部聚合对象动态写入仍不支持；详见[支持契约](docs/dxil.md#m2glsl-源码编译与反射)与 [SM 6.9 宿主要求](docs/dxil.md#m3sm-69-合法化与宿主要求)。
 
 ## 限制
+
+DXIL v2 请求增加内存 include、函数宏、源码映射、显式有界缓存和可选安全优化，保留既有 C ABI 布局。C++ 提供 `CompileSession` 与新增 `GraphicsRequest` 字段。将两个压缩包放入 `example_shaderpack/`，运行 `pwsh -NoProfile -File tests/dxil/m4.ps1` 可验证固定 Minecraft 1.21.4 与 Iris 输入。目前同名 Minecraft VS/PS 配对通过 28/34；iterationRP 通过的 11 对仅为 discard/no-op，Complementary 的 108 对仍有阻塞。输入、限制、所有权、性能和剩余计划见 [M4 契约](docs/m4.md)，这些结果不代表游戏或完整光影包兼容。
 
 第一阶段不支持 UBO/SSBO 块、几何/细分/计算着色器、函数重载、矩阵动态索引和图像原子操作等。完整列表见映射文档的“不支持的特性”一节。

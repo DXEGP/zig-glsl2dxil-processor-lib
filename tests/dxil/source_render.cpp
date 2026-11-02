@@ -35,6 +35,7 @@ static bool reference_coordinates = false;
 static unsigned compilation_index = 0;
 static bool modern_target = false;
 static bool direct_heap = false;
+static bool optimize_programs = false;
 
 static std::string reflection_key(const glsl2hlsl_dxil_graphics_result &value) {
     std::ostringstream key;
@@ -92,18 +93,18 @@ static std::string read_source(const char *path) {
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
-static glsl2hlsl::GraphicsResult compile(std::string_view vertex, std::string_view fragment, bool native = false) {
+static glsl2hlsl::GraphicsResult compile(std::string_view vertex, std::string_view fragment, bool native = false, std::span<const glsl2hlsl_dxil_file> files = {}) {
     auto result = glsl2hlsl::compile_graphics({.vertex=vertex, .fragment=fragment,
         .shader_model=modern_target ? GLSL2HLSL_SM_6_9 : GLSL2HLSL_SM_6_5,
         .coordinates=native ? glsl2hlsl::Coordinates::D3D12Native : glsl2hlsl::Coordinates::OpenGL,
         .binding_mode=direct_heap ? glsl2hlsl::BindingMode::DirectHeap : glsl2hlsl::BindingMode::DescriptorTables,
-        .resource_heap_base=3, .sampler_heap_base=5});
+        .resource_heap_base=3, .sampler_heap_base=5, .files=files, .optimize=optimize_programs});
     for (const auto &diagnostic : result.diagnostics())
         std::cerr << diagnostic.source_name << ':' << diagnostic.line << ':' << diagnostic.column << ": " << diagnostic.message << '\n';
     require(bool(result), "GLSL source compilation failed");
-    if (modern_target) {
+    if (modern_target || optimize_programs) {
         auto baseline = glsl2hlsl::compile_graphics({.vertex=vertex, .fragment=fragment,
-            .coordinates=native ? glsl2hlsl::Coordinates::D3D12Native : glsl2hlsl::Coordinates::OpenGL});
+            .coordinates=native ? glsl2hlsl::Coordinates::D3D12Native : glsl2hlsl::Coordinates::OpenGL, .files=files});
         require(bool(baseline) && reflection_key(baseline.reflection()) == reflection_key(result.reflection()), "SM6.5/6.9 resource, layout or stage interface mismatch");
     }
     const auto prefix = std::string("zig-out/dxil/") + (direct_heap ? "m3-heap" : modern_target ? "m3" : "m2") + "/runtime-" + std::to_string(compilation_index++);
@@ -513,7 +514,7 @@ public:
             }
             D3D12_RANGE empty{}; readback.buffer->Unmap(0, &empty);
         }
-        if (modern_target) {
+        if (modern_target || optimize_programs) {
             const auto found = baseline_pixels.find(name);
             require(found != baseline_pixels.end() && found->second.size() == pixels.size(), "missing SM6.5 pixel baseline");
             for (size_t index = 0; index < pixels.size(); ++index)
@@ -537,6 +538,14 @@ static void acceptance(Renderer &renderer) {
     Draw draw;
     draw.expected = [](unsigned, unsigned, unsigned) { return Color{0.25f, 0.5f, 0.75f, 1}; };
     renderer.run("native-source", basic, draw);
+
+    auto globals=compile(basic_vertex,"const float Z=0.25;const mat2 A=mat2(Z,0,0,2*Z);out vec4 c;void main(){c=vec4(A*vec2(1),Z,1);}",true);
+    Draw global_draw;global_draw.expected=[](unsigned,unsigned,unsigned){return Color{0.25f,0.5f,0.25f,1};};
+    renderer.run("global-initializer-declaration-order",globals,global_draw);
+    auto repeated=compile(basic_vertex,"uniform float a;out vec4 c;void main(){float v=a;float x=v*v+v*v+v*v+v*v;c=vec4(x);}",true);
+    Draw repeated_draw;repeated_draw.floats("a",{0.25f});
+    repeated_draw.expected=[](unsigned,unsigned,unsigned){return Color{0.25f,0.25f,0.25f,0.25f};};
+    renderer.run("safe-cse-captured-input",repeated,repeated_draw);
 
     auto flow = compile(basic_vertex, R"(
         uniform int count; out vec4 c;
@@ -697,10 +706,59 @@ static void acceptance(Renderer &renderer) {
     renderer.run("gl-zero-w",coordinates,zero_w);
 }
 
+static void minecraft_acceptance(Renderer &renderer) {
+    const auto directory = std::string("zig-out/m4/minecraft/assets/minecraft/shaders/");
+    const auto identity = {1.0f,0.0f,0.0f,0.0f,0.0f,1.0f,0.0f,0.0f,0.0f,0.0f,1.0f,0.0f,0.0f,0.0f,0.0f,1.0f};
+    auto color_program = compile(read_source((directory+"core/position_color.vsh").c_str()), read_source((directory+"core/position_color.fsh").c_str()));
+    Draw color;
+    color.attributes.clear();
+    color.attributes[0]=constant_attribute({0.2f,0.4f,0.8f,1});
+    color.attributes[1]=fullscreen().at(0);
+    color.floats("ModelViewMat",identity); color.floats("ProjMat",identity);
+    color.floats("ColorModulator",{0.5f,0.75f,0.25f,1});
+    color.expected=[](unsigned,unsigned,unsigned){return Color{0.1f,0.3f,0.2f,1};};
+    color.depth_test=true; color.expected_depth=[](unsigned,unsigned){return 0.5f;};
+    renderer.run("minecraft-1.21.4-position-color",color_program,color);
+
+    const auto fog_source=read_source((directory+"include/fog.glsl").c_str());
+    constexpr std::string_view fog_name="assets/minecraft/shaders/include/fog.glsl";
+    const glsl2hlsl_dxil_file files[]={{{fog_name.data(),fog_name.size()},{fog_source.data(),fog_source.size()}}};
+    auto fog_program=compile(read_source((directory+"core/position.vsh").c_str()),read_source((directory+"core/position.fsh").c_str()),false,files);
+    for(int shape : {0,1}) {
+        Draw fog;
+        fog.floats("ModelViewMat",identity);fog.floats("ProjMat",identity);fog.integer("FogShape",shape);
+        fog.floats("ColorModulator",{0.2f,0.4f,0.8f,1});fog.floats("FogColor",{0.7f,0.3f,0.1f,0.75f});
+        fog.floats("FogStart",{1});fog.floats("FogEnd",{4});
+        fog.depth_test=true; fog.expected_depth=[](unsigned,unsigned){return 0.5f;};
+        fog.expected=[shape](unsigned x,unsigned y,unsigned){
+            const float u=(float(x)+0.5f)/float(extent), v=1-(float(y)+0.5f)/float(extent);
+            const float weight=(u+v)*0.5f;
+            const float distance=shape==0 ? std::sqrt(2.0f)+(std::sqrt(10.0f)-std::sqrt(2.0f))*weight : 1+2*weight;
+            const float t=std::clamp((distance-1)/3,0.0f,1.0f);
+            const float factor=t*t*(3-2*t)*0.75f;
+            return Color{0.2f*(1-factor)+0.7f*factor,0.4f*(1-factor)+0.3f*factor,0.8f*(1-factor)+0.1f*factor,1};
+        };
+        renderer.run("minecraft-1.21.4-fog-shape-"+std::to_string(shape),fog_program,fog);
+    }
+    const auto discard_vs=read_source("zig-out/m4/iteration-runtime/Lib/Programs/Discard_VS.glsl");
+    const auto discard_ps=read_source("zig-out/m4/iteration-runtime/Lib/Programs/Discard_FS.glsl");
+    constexpr std::string_view vs_name="Lib/Programs/Discard_VS.glsl", ps_name="Lib/Programs/Discard_FS.glsl";
+    const glsl2hlsl_dxil_file discard_files[]={
+        {{vs_name.data(),vs_name.size()},{discard_vs.data(),discard_vs.size()}},
+        {{ps_name.data(),ps_name.size()},{discard_ps.data(),discard_ps.size()}}
+    };
+    auto discard_program=compile(read_source("zig-out/m4/iteration-runtime/composite45.vsh"),read_source("zig-out/m4/iteration-runtime/composite45.fsh"),false,discard_files);
+    Draw discard_draw;discard_draw.depth_test=true;discard_draw.no_coverage=true;
+    discard_draw.expected=[](unsigned,unsigned,unsigned){return clear_color;};
+    discard_draw.expected_depth=[](unsigned,unsigned){return 0.9375f;};
+    renderer.run("iris-iterationRP-0.8.31-discard-noop",discard_program,discard_draw);
+}
+
 int main(int argc, char **argv) {
     try {
         reference_coordinates = argc > 1 && std::string_view(argv[1]) == "--reference";
-        const bool m3 = argc > 1 && std::string_view(argv[1]) == "--m3";
+        const bool m4 = argc > 1 && std::string_view(argv[1]) == "--m4";
+        const bool m3 = m4 || (argc > 1 && std::string_view(argv[1]) == "--m3");
         ensure_no_compiler();
         ComPtr<ID3D12Debug> debug; check(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))); debug->EnableDebugLayer();
         ComPtr<IDXGIFactory1> factory; check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
@@ -715,6 +773,10 @@ int main(int argc, char **argv) {
             char name[256]; WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name), nullptr, nullptr);
             std::cout << "adapter=" << name << " debug_layer=enabled\n";
             Renderer renderer(device.Get()); acceptance(renderer); ++tested;
+            if (m4) {
+                minecraft_acceptance(renderer);
+                optimize_programs=true; acceptance(renderer); minecraft_acceptance(renderer); optimize_programs=false;
+            }
             if (m3) {
                 model.HighestShaderModel = static_cast<D3D_SHADER_MODEL>(0x69);
                 const bool sm69 = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model))) && model.HighestShaderModel >= static_cast<D3D_SHADER_MODEL>(0x69);
@@ -727,13 +789,20 @@ int main(int argc, char **argv) {
                 if (!sm69) { std::cout << "m3_skipped=SM6.9 unavailable\n"; continue; }
                 require(options.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_3 && root_version.HighestVersion >= D3D_ROOT_SIGNATURE_VERSION_1_1, "direct heap device requirements unavailable");
                 modern_target = true; direct_heap = false; acceptance(renderer);
+                if (m4) {
+                    minecraft_acceptance(renderer); optimize_programs=true; acceptance(renderer); minecraft_acceptance(renderer); optimize_programs=false;
+                }
                 direct_heap = true; acceptance(renderer);
+                if (m4) {
+                    minecraft_acceptance(renderer); optimize_programs=true; acceptance(renderer); minecraft_acceptance(renderer); optimize_programs=false;
+                }
                 modern_target = false; direct_heap = false; ++modern_tested;
                 std::cout << "m3_comparison=passed resources=equal interfaces=equal pixels_and_depth=equal\n";
             }
         }
         require(tested != 0, "no SM6.5 hardware adapter"); std::cout << "source_hardware_adapters_passed=" << tested << '\n';
         if (m3) { require(modern_tested != 0, "no SM6.9 hardware adapter; M3 acceptance incomplete"); std::cout << "m3_hardware_adapters_passed=" << modern_tested << '\n'; }
+        if (m4) std::cout << "m4_comparison=passed minecraft=original_sources optimized_pixels_and_depth=equal\n";
         return 0;
     } catch (const std::exception &error) { std::cerr << error.what() << '\n'; return 1; }
 }

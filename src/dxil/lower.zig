@@ -105,11 +105,14 @@ pub const Lowerer = struct {
             };
             try self.handles.append(self.allocator, handle);
         }
-        for (stage.globals.items) |global| if (global.kind == .constant or global.kind == .plain) {
-            if (global.decl.initializer) |initializer| {
-                const result = try self.convert(try self.expression(initializer), global.typ, false, global.decl.line);
-                try self.write(self.findVariable(global.decl.name).?, result);
-            } else if (global.kind == .constant) return self.fail(global.decl.line, "const requires an initializer", .{});
+        for (stage.unit.decls) |declaration| if (declaration.* == .var_decl) {
+            const global = self.findGlobal(declaration.var_decl.name).?;
+            if (global.kind == .constant or global.kind == .plain) {
+                if (global.decl.initializer) |initializer| {
+                    const result = try self.convert(try self.expression(initializer), global.typ, false, global.decl.line);
+                    try self.write(self.findVariable(global.decl.name).?, result);
+                } else if (global.kind == .constant) return self.fail(global.decl.line, "const requires an initializer", .{});
+            }
         };
         var arguments: std.ArrayList(*ast.Expr) = .empty;
         if (self.validation_entry) |entry| for (stage.unit.decls) |declaration| {
@@ -812,6 +815,24 @@ pub const Lowerer = struct {
             const parts = try self.allocator.alloc(ir.ValueId, args[0].parts.len);
             for (args[0].parts, parts) |part, *output| output.* = try self.module.binary(.mul, part, result);
             return .{ .typ = args[0].typ, .parts = parts };
+        }
+        if (std.mem.eql(u8, name, "clamp") or std.mem.eql(u8, name, "smoothstep")) {
+            const smooth = std.mem.eql(u8, name, "smoothstep");
+            if (args.len != 3) return self.fail(call_node.line, "clamp/smoothstep require three arguments", .{});
+            const value = args[if (smooth) @as(usize, 2) else 0];
+            const low = args[if (smooth) @as(usize, 0) else 1];
+            const high = args[if (smooth) @as(usize, 1) else 2];
+            if (value.typ.scalar != .float or value.typ.cols != 1 or value.typ.array_len != 0 or low.typ.scalar != .float or high.typ.scalar != .float or !low.typ.same(high.typ) or (low.parts.len != 1 and !low.typ.same(value.typ))) return self.fail(call_node.line, "invalid clamp/smoothstep argument types", .{});
+            const parts = try self.allocator.alloc(ir.ValueId, value.parts.len);
+            for (parts, value.parts, 0..) |*part, component, index| {
+                const lower_bound = low.parts[if (low.parts.len == 1) 0 else index];
+                const upper = high.parts[if (high.parts.len == 1) 0 else index];
+                const source = if (smooth) try self.module.binary(.fdiv, try self.module.binary(.sub, component, lower_bound), try self.module.binary(.sub, upper, lower_bound)) else component;
+                const maximum = try self.module.call(.binary, &.{ try self.integer(.i32, 35), source, if (smooth) try self.module.float(0) else lower_bound });
+                const bounded = try self.module.call(.binary, &.{ try self.integer(.i32, 36), maximum, if (smooth) try self.module.float(1) else upper });
+                part.* = if (smooth) try self.module.binary(.mul, try self.module.binary(.mul, bounded, bounded), try self.module.binary(.sub, try self.module.float(3), try self.module.binary(.mul, try self.module.float(2), bounded))) else bounded;
+            }
+            return .{ .typ = value.typ, .parts = parts };
         }
         if (std.mem.eql(u8, name, "mix")) {
             if (args.len != 3 or !self.program.equivalent(args[0].typ, args[1].typ) or args[0].typ.scalar != .float or args[2].typ.scalar != .float or (args[2].parts.len != 1 and args[2].parts.len != args[0].parts.len)) return self.fail(call_node.line, "invalid mix arguments", .{});

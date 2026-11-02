@@ -26,6 +26,21 @@ int report(const char *message, int failures) {
 
 int main() {
     int failures = 0;
+    glsl2hlsl::GraphicsResult retained;
+    {
+        glsl2hlsl::CompileSession session;
+        constexpr std::string_view include = "#define COLOR vec4(1)\n";
+        const glsl2hlsl_dxil_file files[] = {{{"color", 5}, {include.data(), include.size()}}};
+        glsl2hlsl::GraphicsRequest request{.vertex="void main(){gl_Position=vec4(0,0,0,1);}",
+            .fragment="#include \"color\"\nout vec4 c;void main(){c=COLOR;}",
+            .files=files, .optimize=true, .session=session.get()};
+        auto first = glsl2hlsl::compile_graphics(request);
+        retained = glsl2hlsl::compile_graphics(request);
+        if (!first || !retained || session.stats().hits != 1) failures = report("VFS cache compilation failed", failures);
+        auto moved_session = std::move(session);
+        if (session.get() || moved_session.stats().hits != 1) failures = report("cache session move failed", failures);
+    }
+    if (!retained || retained.vertex().empty()) failures = report("cached result lifetime failed", failures);
     static_assert(!std::is_copy_constructible_v<glsl2hlsl::GraphicsResult>);
     static_assert(std::is_nothrow_move_constructible_v<glsl2hlsl::GraphicsResult>);
     auto graphics = glsl2hlsl::compile_graphics({
