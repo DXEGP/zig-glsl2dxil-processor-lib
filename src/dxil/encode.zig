@@ -1,5 +1,6 @@
 const std = @import("std");
 const ir = @import("ir.zig");
+const targets = @import("target.zig");
 const Writer = @import("bitstream.zig").Writer;
 const Record = struct { code: u32, operands: []const u64 };
 const Constant = struct { typ: u32, record: Record };
@@ -106,7 +107,7 @@ pub fn analyze(allocator: std.mem.Allocator, program: *const ir.Module) !Analysi
     const dependencies = try allocator.alloc(u32, input_count * output_words);
     @memset(dependencies, 0);
     const words = (input_count + 31) / 32;
-    const value_dependencies = try allocator.alloc(u32, program.values.items.len * words);
+    const value_dependencies = try allocator.alloc(u32, program.values.items.len * 4 * words);
     @memset(value_dependencies, 0);
     const block_dependencies = try allocator.alloc(u32, program.blocks.items.len * words);
     @memset(block_dependencies, 0);
@@ -128,18 +129,36 @@ pub fn analyze(allocator: std.mem.Allocator, program: *const ir.Module) !Analysi
                     for ([_]ir.BlockId{ branch.yes, branch.no }) |target| {
                         const destination = block_dependencies[target * words ..][0..words];
                         changed = merge(destination, source) or changed;
-                        changed = merge(destination, value_dependencies[branch.condition * words ..][0..words]) or changed;
+                        changed = merge(destination, value_dependencies[branch.condition * 4 * words ..][0..words]) or changed;
                     }
                 },
                 else => {},
             }
         }
-        for (program.values.items, 0..) |value, value_index| {
-            const destination = value_dependencies[value_index * words ..][0..words];
-            if (value.instruction != .constant and value.instruction != .undef)
+        for (program.values.items, 0..) |value, value_index| for (0..value.typ.lanes()) |lane| {
+            const destination = value_dependencies[(value_index * 4 + lane) * words ..][0..words];
+            if (value.instruction != .constant and value.instruction != .undef and value.instruction != .aggregate)
                 changed = merge(destination, block_dependencies[owners[value_index] * words ..][0..words]) or changed;
             switch (value.instruction) {
-                .constant, .undef => {},
+                .constant, .undef, .aggregate => {},
+                .insert => |operation| {
+                    const index = program.values.items[operation.index].instruction;
+                    if (index == .constant) {
+                        const operand = if (index.constant == lane) operation.value else operation.vector;
+                        changed = merge(destination, laneDependencies(program, value_dependencies, words, operand, lane)) or changed;
+                    } else {
+                        for ([_]ir.ValueId{ operation.vector, operation.value, operation.index }) |operand| changed = merge(destination, laneDependencies(program, value_dependencies, words, operand, lane)) or changed;
+                    }
+                },
+                .element => |operation| {
+                    const index = program.values.items[operation.index].instruction;
+                    if (index == .constant) {
+                        changed = merge(destination, laneDependencies(program, value_dependencies, words, operation.vector, index.constant)) or changed;
+                    } else {
+                        changed = merge(destination, laneDependencies(program, value_dependencies, words, operation.index, 0)) or changed;
+                        for (0..program.values.items[operation.vector].typ.lanes()) |component| changed = merge(destination, laneDependencies(program, value_dependencies, words, operation.vector, component)) or changed;
+                    }
+                },
                 .call => |operation| {
                     if (operation.op == .load_f32 or operation.op == .load_i32) {
                         const element_id = program.values.items[operation.args[1]].instruction.constant;
@@ -155,37 +174,37 @@ pub fn analyze(allocator: std.mem.Allocator, program: *const ir.Module) !Analysi
                         }
                     } else {
                         for (operation.args) |operand| {
-                            changed = merge(destination, value_dependencies[operand * words ..][0..words]) or changed;
+                            changed = merge(destination, laneDependencies(program, value_dependencies, words, operand, lane)) or changed;
                         }
                     }
                 },
                 .binary => |operation| {
-                    changed = merge(destination, value_dependencies[operation.left * words ..][0..words]) or changed;
-                    changed = merge(destination, value_dependencies[operation.right * words ..][0..words]) or changed;
+                    changed = merge(destination, laneDependencies(program, value_dependencies, words, operation.left, lane)) or changed;
+                    changed = merge(destination, laneDependencies(program, value_dependencies, words, operation.right, lane)) or changed;
                 },
                 .compare => |operation| {
-                    changed = merge(destination, value_dependencies[operation.left * words ..][0..words]) or changed;
-                    changed = merge(destination, value_dependencies[operation.right * words ..][0..words]) or changed;
+                    changed = merge(destination, laneDependencies(program, value_dependencies, words, operation.left, lane)) or changed;
+                    changed = merge(destination, laneDependencies(program, value_dependencies, words, operation.right, lane)) or changed;
                 },
                 .cast => |operation| {
-                    changed = merge(destination, value_dependencies[operation.value * words ..][0..words]) or changed;
+                    changed = merge(destination, laneDependencies(program, value_dependencies, words, operation.value, lane)) or changed;
                 },
                 .extract => |operation| {
-                    changed = merge(destination, value_dependencies[operation.value * words ..][0..words]) or changed;
+                    changed = merge(destination, laneDependencies(program, value_dependencies, words, operation.value, lane)) or changed;
                 },
                 .select => |operation| {
                     for ([_]ir.ValueId{ operation.condition, operation.yes, operation.no }) |operand| {
-                        changed = merge(destination, value_dependencies[operand * words ..][0..words]) or changed;
+                        changed = merge(destination, laneDependencies(program, value_dependencies, words, operand, lane)) or changed;
                     }
                 },
                 .phi => |incoming| {
                     for (incoming) |edge| {
-                        changed = merge(destination, value_dependencies[edge.value * words ..][0..words]) or changed;
+                        changed = merge(destination, laneDependencies(program, value_dependencies, words, edge.value, lane)) or changed;
                         changed = merge(destination, block_dependencies[edge.block * words ..][0..words]) or changed;
                     }
                 },
             }
-        }
+        };
     }
     for (program.values.items, 0..) |value, value_index| if (value.instruction == .call) {
         const operation = value.instruction.call;
@@ -195,12 +214,17 @@ pub fn analyze(allocator: std.mem.Allocator, program: *const ir.Module) !Analysi
         outputs[element_id].usage |= @as(u8, 1) << @intCast(column);
         if (outputs[element_id].semantic == .depth) continue;
         const output = outputs[element_id].row * 4 + column;
-        const source = value_dependencies[value_index * words ..][0..words];
+        const source = value_dependencies[value_index * 4 * words ..][0..words];
         for (0..input_count) |input| if (source[input / 32] & (@as(u32, 1) << @intCast(input % 32)) != 0) {
             dependencies[input * output_words + output / 32] |= @as(u32, 1) << @intCast(output % 32);
         };
     };
     return .{ .inputs = inputs, .outputs = outputs, .input_count = input_count, .output_count = output_count, .dependencies = dependencies };
+}
+
+fn laneDependencies(program: *const ir.Module, dependencies: []const u32, words: u32, id: ir.ValueId, lane: usize) []const u32 {
+    const component = if (program.values.items[id].typ.lanes() > 1) lane else 0;
+    return dependencies[(id * 4 + component) * words ..][0..words];
 }
 
 fn merge(destination: []u32, source: []const u32) bool {
@@ -212,7 +236,7 @@ fn merge(destination: []u32, source: []const u32) bool {
     return changed;
 }
 
-pub fn emit(allocator: std.mem.Allocator, program: *const ir.Module, analysis: Analysis) ![]u8 {
+pub fn emit(allocator: std.mem.Allocator, program: *const ir.Module, analysis: Analysis, target: targets.Target) ![]u8 {
     var builder: Builder = .{ .allocator = allocator };
     var function_ids: [@typeInfo(ir.Op).@"enum".field_names.len]u32 = @splat(0);
     var function_types: [@typeInfo(ir.Op).@"enum".field_names.len]u32 = @splat(0);
@@ -233,8 +257,12 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Module, analysis: A
     _ = try builder.typeRecord(20, &.{ 0, 4, 4, 4, 4 });
     _ = try builder.typeRecord(20, &.{ 0, 3, 3, 3, 3 });
     _ = try builder.typeRecord(20, &.{ 0, 4, 4, 4, 4, 3 });
-    _ = try builder.typeRecord(21, &.{ 0, 0 });
-    const entry_pointer = try builder.typeRecord(8, &.{ 10, 0 });
+    _ = try builder.namedStruct("dx.types.ResBind", &.{ 0, 3, 3, 3, 2 });
+    _ = try builder.namedStruct("dx.types.ResourceProperties", &.{ 0, 3, 3 });
+    for ([_]ir.Type{ .f32x2, .f32x3, .f32x4, .i32x2, .i32x3, .i32x4 }) |typ| _ = try builder.typeRecord(12, &.{ typ.lanes(), @backingInt(typ.scalar()) });
+    _ = try builder.typeRecord(7, &.{64});
+    const entry_type = try builder.typeRecord(21, &.{ 0, 0 });
+    const entry_pointer = try builder.typeRecord(8, &.{ entry_type, 0 });
     for (std.enums.values(ir.Op)) |op| {
         const index = @backingInt(op);
         if (function_ids[index] == 0) continue;
@@ -250,10 +278,16 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Module, analysis: A
     for (program.values.items, 0..) |value, index| switch (value.instruction) {
         .constant => |bits| value_ids[index] = try builder.scalar(value.typ, bits),
         .undef => value_ids[index] = try builder.constant(@backingInt(value.typ), 3, &.{}),
+        .aggregate => |fields| {
+            var operands: [4]u64 = undefined;
+            const length: usize = if (value.typ == .res_binding) 4 else 2;
+            for (fields[0..length], 0..) |field, field_index| operands[field_index] = try builder.scalar(if (value.typ == .res_binding and field_index == 3) .i8 else .i32, field);
+            value_ids[index] = try builder.constant(@backingInt(value.typ), 7, operands[0..length]);
+        },
         else => {},
     };
-    const version = try builder.meta(3, &.{ try builder.integer(.i32, 1), try builder.integer(.i32, 5) });
-    const shader_model = try builder.meta(3, &.{ try builder.text(if (program.stage == .vertex) "vs" else "ps"), try builder.integer(.i32, 6), try builder.integer(.i32, 5) });
+    const version = try builder.meta(3, &.{ try builder.integer(.i32, 1), try builder.integer(.i32, target.minor()) });
+    const shader_model = try builder.meta(3, &.{ try builder.text(if (program.stage == .vertex) "vs" else "ps"), try builder.integer(.i32, 6), try builder.integer(.i32, target.minor()) });
     const signatures = try builder.meta(3, &.{ try builder.signature(analysis.inputs), try builder.signature(analysis.outputs), 0 });
     var resource_lists: [4]std.ArrayList(u64) = @splat(.empty);
     for (program.resources.items) |resource| {
@@ -288,7 +322,10 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Module, analysis: A
         node.* = try builder.meta(3, list.items);
     };
     const resources = if (program.resources.items.len != 0) try builder.meta(3, &resource_nodes) else 0;
-    const entry = try builder.meta(3, &.{ try builder.value(entry_pointer, 0), try builder.text("main"), signatures, resources, 0 });
+    const features = targets.requirements(program, target).feature_flags;
+    const raw_flags = features << 5;
+    const flags = if (raw_flags != 0) try builder.meta(3, &.{ try builder.integer(.i32, 0), try builder.value(@backingInt(ir.Type.i64), try builder.constant(@backingInt(ir.Type.i64), 4, &.{raw_flags << 1})) }) else 0;
+    const entry = try builder.meta(3, &.{ try builder.value(entry_pointer, 0), try builder.text("main"), signatures, resources, flags });
     var view_values: std.ArrayList(u64) = .empty;
     try view_values.append(allocator, try builder.scalar(.i32, analysis.input_count));
     try view_values.append(allocator, try builder.scalar(.i32, analysis.output_count));
@@ -332,7 +369,7 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Module, analysis: A
     try writer.end(attributes);
     try writer.textRecord(2, &.{}, "dxil-ms-dx");
     try writer.textRecord(3, &.{}, "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64");
-    try writer.record(8, &.{ 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+    try writer.record(8, &.{ entry_type, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
     var function_index: u32 = 1;
     while (function_index < builder.functions) : (function_index += 1) {
         for (std.enums.values(ir.Op)) |op| {
@@ -377,7 +414,18 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Module, analysis: A
             const value = program.values.items[id];
             var operands: std.ArrayList(u64) = .empty;
             const code: u32 = switch (value.instruction) {
-                .constant, .undef => unreachable,
+                .constant, .undef, .aggregate => unreachable,
+                .insert => |operation| code: {
+                    try pushValue(&operands, allocator, program, value_ids, next_value, operation.vector, true);
+                    try pushValue(&operands, allocator, program, value_ids, next_value, operation.value, true);
+                    try pushValue(&operands, allocator, program, value_ids, next_value, operation.index, true);
+                    break :code 7;
+                },
+                .element => |operation| code: {
+                    try pushValue(&operands, allocator, program, value_ids, next_value, operation.vector, true);
+                    try pushValue(&operands, allocator, program, value_ids, next_value, operation.index, true);
+                    break :code 6;
+                },
                 .binary => |operation| code: {
                     try pushValue(&operands, allocator, program, value_ids, next_value, operation.left, true);
                     try pushValue(&operands, allocator, program, value_ids, next_value, operation.right, false);
@@ -465,7 +513,7 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Module, analysis: A
         switch (block.terminator) {
             .none => return error.InvalidIr,
             .ret => try writer.record(10, &.{}),
-            .branch => |target| try writer.record(11, &.{target}),
+            .branch => |destination| try writer.record(11, &.{destination}),
             .conditional => |branch| try writer.record(11, &.{ branch.yes, branch.no, next_value -% value_ids[branch.condition] }),
         }
     }
@@ -477,4 +525,26 @@ pub fn emit(allocator: std.mem.Allocator, program: *const ir.Module, analysis: A
 fn pushValue(operands: *std.ArrayList(u64), allocator: std.mem.Allocator, program: *const ir.Module, ids: []const u32, next: u32, value: ir.ValueId, typed: bool) !void {
     try operands.append(allocator, next -% ids[value]);
     if (typed and ids[value] >= next) try operands.append(allocator, @backingInt(program.values.items[value].typ));
+}
+
+test "native vector dependencies retain per lane input precision" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var program = ir.Module.init(allocator, .fragment);
+    _ = try program.block();
+    try program.inputs.append(allocator, .{ .name = "TEXCOORD", .columns = 3, .interpolation = 2 });
+    try program.outputs.append(allocator, .{ .name = "SV_Target", .semantic = .target, .columns = 1 });
+    var vector = try program.undef(.f32x3);
+    for (0..3) |component| {
+        const input = try program.intrinsic(.load_f32, &.{ try program.constant(.i32, 0), try program.constant(.i32, 0), try program.constant(.i8, @intCast(component)), try program.undef(.i32) });
+        vector = try program.add(.f32x3, .{ .insert = .{ .vector = vector, .value = input, .index = try program.constant(.i32, @intCast(component)) } });
+    }
+    const sum = try program.binary(.add, vector, vector);
+    const scalar = try program.add(.f32, .{ .element = .{ .vector = sum, .index = try program.constant(.i32, 1) } });
+    _ = try program.intrinsic(.store_f32, &.{ try program.constant(.i32, 0), try program.constant(.i32, 0), try program.constant(.i8, 0), scalar });
+    program.terminate(.ret);
+    try program.verify(allocator);
+    const analysis = try analyze(allocator, &program);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 0 }, analysis.dependencies);
 }

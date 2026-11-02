@@ -8,6 +8,7 @@ const container = @import("container.zig");
 const sema = @import("sema.zig");
 const Lowerer = @import("lower.zig").Lowerer;
 const ir = @import("ir.zig");
+pub const targets = @import("target.zig");
 
 pub const Coordinates = enum { opengl, d3d12_native };
 pub const Source = struct { source: []const u8, name: []const u8 = "" };
@@ -39,6 +40,8 @@ pub const GraphicsRequest = struct {
     target: container.Target = .sm65,
     coordinates: Coordinates = .opengl,
     measurement: ?*Measurement = null,
+    binding_mode: targets.BindingMode = .descriptor_tables,
+    heap_layout: targets.HeapLayout = .{},
 };
 pub const Reflection = struct {
     schema_version: u32 = 1,
@@ -50,6 +53,9 @@ pub const Reflection = struct {
     vertex_outputs: []const ir.Signature,
     fragment_inputs: []const ir.Signature,
     fragment_outputs: []const ir.Signature,
+    requirements: targets.Requirements,
+    binding_mode: targets.BindingMode,
+    heap_bindings: []const targets.HeapBinding,
 };
 pub const GraphicsResult = struct {
     arena: std.heap.ArenaAllocator,
@@ -65,7 +71,7 @@ pub const GraphicsResult = struct {
 pub const Error = error{ InvalidShader, OutOfMemory, UnsupportedTarget };
 
 pub fn compileGraphics(allocator: std.mem.Allocator, request: GraphicsRequest, diagnostics: *diag.Diagnostics) Error!GraphicsResult {
-    if (request.target != .sm65) return error.UnsupportedTarget;
+    if (request.target == .sm65 and request.binding_mode == .direct_heap) return error.UnsupportedTarget;
     var lap = Lap.start(request.measurement);
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
@@ -101,6 +107,19 @@ pub fn compileGraphics(allocator: std.mem.Allocator, request: GraphicsRequest, d
     lap.finish("frontend_ns");
     var program: sema.Program = .{ .allocator = scratch, .diagnostics = diagnostics, .stages = .{ .{ .unit = units[0], .name = names[0] }, .{ .unit = units[1], .name = names[1] } }, .opengl = request.coordinates == .opengl };
     try program.analyze();
+    const heap_bindings = try scratch.alloc(targets.HeapBinding, if (request.binding_mode == .direct_heap) program.bindings.items.len else 0);
+    var resource_index: u64 = request.heap_layout.resource_base;
+    var sampler_index: u64 = request.heap_layout.sampler_base;
+    for (heap_bindings, program.bindings.items[0..heap_bindings.len], 0..) |*destination, binding, index| {
+        const next = if (binding.class == .sampler) &sampler_index else &resource_index;
+        if (next.* >= (if (binding.class == .sampler) @as(u64, 2048) else 1000000)) {
+            diagnostics.code = .unsupported;
+            try diagnostics.err(1, 1, "direct descriptor heap layout exceeds D3D12 heap limits");
+            return error.InvalidShader;
+        }
+        destination.* = .{ .binding_index = @intCast(index), .heap_index = @intCast(next.*) };
+        next.* += 1;
+    }
     for (program.stages, 0..) |stage, stage_index| for (stage.unit.decls) |declaration| {
         if (declaration.* != .function or declaration.function.body == null) continue;
         var validation_arena = std.heap.ArenaAllocator.init(scratch);
@@ -111,9 +130,26 @@ pub fn compileGraphics(allocator: std.mem.Allocator, request: GraphicsRequest, d
     };
     lap.finish("semantics_ns");
     var vertex_lowerer = Lowerer.init(scratch, &program, 0);
+    vertex_lowerer.native_vectors = request.target == .sm69;
+    vertex_lowerer.binding_mode = request.binding_mode;
+    vertex_lowerer.heap_bindings = heap_bindings;
     var vertex = try vertex_lowerer.lower();
     var fragment_lowerer = Lowerer.init(scratch, &program, 1);
+    fragment_lowerer.native_vectors = request.target == .sm69;
+    fragment_lowerer.binding_mode = request.binding_mode;
+    fragment_lowerer.heap_bindings = heap_bindings;
     var fragment = try fragment_lowerer.lower();
+    if (request.binding_mode == .direct_heap) {
+        vertex.resources.clearRetainingCapacity();
+        fragment.resources.clearRetainingCapacity();
+    }
+    var requirements = targets.requirements(&vertex, request.target);
+    const fragment_requirements = targets.requirements(&fragment, request.target);
+    requirements.feature_flags |= fragment_requirements.feature_flags;
+    requirements.root_flags |= fragment_requirements.root_flags;
+    requirements.root_signature_version = @max(requirements.root_signature_version, fragment_requirements.root_signature_version);
+    requirements.resource_binding_tier = @max(requirements.resource_binding_tier, fragment_requirements.resource_binding_tier);
+    requirements.native_vectors = requirements.native_vectors or fragment_requirements.native_vectors;
     lap.finish("lower_ns");
     const vertex_bytes = container.emitModule(scratch, &vertex, request.target) catch |err| return backendError(diagnostics, err);
     const fragment_bytes = container.emitModule(scratch, &fragment, request.target) catch |err| return backendError(diagnostics, err);
@@ -127,6 +163,9 @@ pub fn compileGraphics(allocator: std.mem.Allocator, request: GraphicsRequest, d
         .vertex_outputs = vertex.outputs.items,
         .fragment_inputs = fragment.inputs.items,
         .fragment_outputs = fragment.outputs.items,
+        .requirements = requirements,
+        .binding_mode = request.binding_mode,
+        .heap_bindings = heap_bindings,
     } };
 }
 
@@ -222,19 +261,65 @@ test "uniform packing and stage linkage remain deterministic" {
     }
 }
 
-fn allocationTrial(allocator: std.mem.Allocator) !void {
+fn allocationTrial(allocator: std.mem.Allocator, target: container.Target, binding_mode: targets.BindingMode) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     var diagnostics = diag.Diagnostics.init(arena.allocator());
     var result = try compileGraphics(allocator, .{
         .vertex = .{ .source = "layout(location=0) in vec4 p; out vec2 uv; void main(){gl_Position=p;uv=p.xy;}" },
         .fragment = .{ .source = "in vec2 uv; uniform float w[2]; out vec4 c; void main(){float x=0;for(int i=0;i<2;i++){x+=w[i];}c=vec4(uv,x,1);}" },
+        .target = target,
+        .binding_mode = binding_mode,
     }, &diagnostics);
     defer result.deinit();
 }
 
 test "paired source compilation releases all allocations on failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationTrial, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationTrial, .{ container.Target.sm65, targets.BindingMode.descriptor_tables });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationTrial, .{ container.Target.sm69, targets.BindingMode.descriptor_tables });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationTrial, .{ container.Target.sm69, targets.BindingMode.direct_heap });
+}
+
+test "SM6.9 preserves uniform layouts and signatures and reports heap requirements" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var diagnostics = diag.Diagnostics.init(arena.allocator());
+    var request: GraphicsRequest = .{
+        .vertex = .{ .source = "layout(location=0) in vec4 p; out vec2 uv; void main(){gl_Position=p;uv=p.xy+vec2(0.25);}" },
+        .fragment = .{ .source = "in vec2 uv; uniform sampler2D tex; uniform vec3 tint; uniform float alpha; out vec4 c; void main(){c=texture(tex,uv)*vec4(tint,alpha);}" },
+    };
+    var legacy = try compileGraphics(std.testing.allocator, request, &diagnostics);
+    defer legacy.deinit();
+    request.target = .sm69;
+    for ([_]targets.BindingMode{ .descriptor_tables, .direct_heap }) |mode| {
+        request.binding_mode = mode;
+        request.heap_layout = .{ .resource_base = 7, .sampler_base = 11 };
+        var modern = try compileGraphics(std.testing.allocator, request, &diagnostics);
+        defer modern.deinit();
+        try std.testing.expectEqualDeep(legacy.reflection.uniforms, modern.reflection.uniforms);
+        try std.testing.expectEqualDeep(legacy.reflection.bindings, modern.reflection.bindings);
+        try std.testing.expectEqualDeep(legacy.reflection.vertex_inputs, modern.reflection.vertex_inputs);
+        try std.testing.expectEqualDeep(legacy.reflection.vertex_outputs, modern.reflection.vertex_outputs);
+        try std.testing.expectEqualDeep(legacy.reflection.fragment_inputs, modern.reflection.fragment_inputs);
+        try std.testing.expectEqualDeep(legacy.reflection.fragment_outputs, modern.reflection.fragment_outputs);
+        const requirements = modern.reflection.requirements;
+        try std.testing.expect(requirements.native_vectors);
+        try std.testing.expectEqual(@as(u32, 69), requirements.shader_model);
+        try std.testing.expectEqual(@as(u32, 3), requirements.psv_version);
+        if (mode == .direct_heap) {
+            try std.testing.expectEqual(@as(u32, 0xc00), requirements.root_flags);
+            try std.testing.expectEqual(@as(u64, 0x6000000), requirements.feature_flags);
+            try std.testing.expectEqual(@as(u32, 7), modern.reflection.heap_bindings[0].heap_index);
+            try std.testing.expectEqual(@as(u32, 11), modern.reflection.heap_bindings[3].heap_index);
+        } else try std.testing.expectEqual(@as(u32, 0), requirements.root_flags);
+    }
+    request.target = .sm65;
+    try std.testing.expectError(error.UnsupportedTarget, compileGraphics(std.testing.allocator, request, &diagnostics));
+    request.target = .sm69;
+    request.heap_layout.resource_base = 1000000;
+    try std.testing.expectError(error.InvalidShader, compileGraphics(std.testing.allocator, request, &diagnostics));
+    request.heap_layout = .{ .sampler_base = 2048 };
+    try std.testing.expectError(error.InvalidShader, compileGraphics(std.testing.allocator, request, &diagnostics));
 }
 
 test "literal and control statement diagnostics preserve source positions" {

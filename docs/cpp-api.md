@@ -269,7 +269,7 @@ zig build cpp-test
 `zig build test` 覆盖 Zig 核心与 C ABI 的转换、错误诊断和参数校验；`zig build c-test` 用 C23 编译并运行 C 互操作测试；`zig build cpp-test` 分别用 C++23 和 C++26 编译并运行同一份 C++ 互操作测试，检查头文件、链接、结果读取和错误处理。
 ## DXIL 二进制发射接口
 
-M1 新增 `glsl2hlsl_dxil_emit` 与 `glsl2hlsl_dxil_result_free`，支持程序化 SM 6.5 顶点位置透传及参数化常量片元输出。结果使用 `uint8_t*` 和长度，不保证末尾零字节，需用专用函数释放。SM 6.9 暂返回 `GLSL2HLSL_STATUS_UNSUPPORTED_TARGET`（4）；旧状态编号和文本结果结构保持不变。详细参数、所有权和当前限制见 [DXIL 文档](dxil.md#c-abi)。C++ 调用方可直接使用这组 C ABI。
+M1 新增 `glsl2hlsl_dxil_emit` 与 `glsl2hlsl_dxil_result_free`，支持程序化顶点位置透传及参数化常量片元输出；M3 扩展为支持 SM 6.5 与 SM 6.9。结果使用 `uint8_t*` 和长度，不保证末尾零字节，需用专用函数释放。旧状态编号和文本结果结构保持不变。详细参数、所有权和当前限制见 [DXIL 文档](dxil.md#c-abi)。C++ 调用方可直接使用这组 C ABI。
 
 ## DXIL 配对源码接口
 
@@ -289,3 +289,7 @@ if (!program) {
 ```
 
 默认使用 `Coordinates::OpenGL`。此模式要求绑定反射中的 `GlCompat` cbuffer，并通过 `prepare_gl_state(state, prepared)` 同步设置 viewport、正面绕序和 DrawInstanced 的起始实例；详细步骤和数值契约见 [DXIL 文档](dxil.md#m2glsl-源码编译与反射)。单独创建 PSO 或仅上传 uniform 不足以完成 GL 状态映射。
+
+SM 6.9 显式设置 `.shader_model = GLSL2HLSL_SM_6_9`，默认继续使用描述符表。选择 `.binding_mode = glsl2hlsl::BindingMode::DirectHeap` 后，可用 `.resource_heap_base` / `.sampler_heap_base` 预留堆槽。成功结果的 `execution_info()` 返回设备/根签名要求及 `heap_bindings` 借用数组；`binding_index` 对应 `reflection().bindings`，`heap_index` 是独立资源或 sampler 堆的绝对槽位。结果销毁后该数组失效，移动结果会转移其所有权。
+
+宿主先查询 SM 6.9、资源绑定 Tier 3、根签名 1.1，按返回 `root_flags` 创建根签名，填充堆后先调用 `SetDescriptorHeaps` 再调用 `SetGraphicsRootSignature`。SM 6.5 请求直接堆返回 `Status::UnsupportedTarget`。完整协议与测试运行时要求见 [SM 6.9 文档](dxil.md#m3sm-69-合法化与宿主要求)。

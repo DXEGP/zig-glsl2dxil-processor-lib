@@ -8,6 +8,12 @@ const graphics_capi = @import("dxil/capi.zig");
 export fn glsl2hlsl_dxil_compile_graphics(request: ?*const graphics_capi.Options, result: ?*graphics_capi.Result) c_int {
     return graphics_capi.compile(request, result);
 }
+export fn glsl2hlsl_dxil_compile_graphics_ex(request: ?*const graphics_capi.OptionsEx, result: ?*graphics_capi.Result) c_int {
+    return graphics_capi.compileEx(request, result);
+}
+export fn glsl2hlsl_dxil_graphics_execution_info(result: ?*const graphics_capi.Result, info: ?*graphics_capi.ExecutionInfo) c_int {
+    return graphics_capi.executionInfo(result, info);
+}
 export fn glsl2hlsl_dxil_graphics_result_free(result: ?*graphics_capi.Result) void {
     graphics_capi.free(result);
 }
@@ -242,8 +248,9 @@ test "DXIL C ABI owns binary results and distinguishes unsupported targets" {
     glsl2hlsl_dxil_result_free(&result);
     try std.testing.expectEqual(@as(usize, 0), result.output_length);
     request.shader_model = 69;
-    try std.testing.expectEqual(STATUS_UNSUPPORTED_TARGET, glsl2hlsl_dxil_emit(&request, &result));
-    try std.testing.expect(result.output == null);
+    try std.testing.expectEqual(STATUS_OK, glsl2hlsl_dxil_emit(&request, &result));
+    try dxil.validate(result.output.?[0..result.output_length]);
+    glsl2hlsl_dxil_result_free(&result);
     try std.testing.expectEqual(STATUS_INVALID_ARGUMENT, glsl2hlsl_dxil_emit(null, &result));
     try std.testing.expectEqual(STATUS_INVALID_ARGUMENT, glsl2hlsl_dxil_emit(&request, null));
     request.shader_model = 65;

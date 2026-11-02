@@ -77,6 +77,28 @@ try {
     if ((Get-FileHash -LiteralPath $hashSource -Algorithm SHA256).Hash -ne $baseline.hashReference.sha256) {
         throw 'cached upstream hash reference does not match the pinned SHA256'
     }
+    $output = Join-Path $root 'zig-out/dxil'
+    foreach ($directory in @('m2', 'm3', 'm3-heap')) {
+        $generated = [IO.Path]::GetFullPath((Join-Path $output $directory))
+        if (-not $generated.StartsWith([IO.Path]::GetFullPath($output) + [IO.Path]::DirectorySeparatorChar)) { throw 'invalid generated shader directory' }
+        if (Test-Path -LiteralPath $generated) {
+            Get-ChildItem -LiteralPath $generated -File | Where-Object { $_.Extension -in @('.dxil', '.json', '.ll') } | ForEach-Object { Remove-Item -LiteralPath $_.FullName }
+        }
+    }
+    $agilityPackage = Join-Path $cacheDirectory "agility-$($baseline.agility.version).nupkg"
+    if (-not (Test-Path -LiteralPath $agilityPackage)) { Invoke-WebRequest -Uri $baseline.agility.url -OutFile $agilityPackage }
+    if ((Get-FileHash -LiteralPath $agilityPackage -Algorithm SHA256).Hash -ne $baseline.agility.sha256) { throw 'Agility SDK package hash mismatch' }
+    $agilityDirectory = Join-Path $output 'agility'
+    New-Item -ItemType Directory -Path $agilityDirectory -Force | Out-Null
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [IO.Compression.ZipFile]::OpenRead($agilityPackage)
+    try {
+        foreach ($name in @('D3D12Core.dll', 'd3d12SDKLayers.dll')) {
+            $entry = $archive.GetEntry("build/native/bin/x64/$name")
+            if (-not $entry) { throw "missing Agility SDK file: $name" }
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $agilityDirectory $name), $true)
+        }
+    } finally { $archive.Dispose() }
 
     Invoke-Checked zig @('build', 'test', 'c-test', 'cpp-test', 'dxil-c-test', 'dxil-fixtures', 'dxil-source-fixtures', '-Doptimize=ReleaseSafe', '--summary', 'all')
     Invoke-Checked zig @('build', '-Doptimize=ReleaseSafe')
@@ -95,7 +117,7 @@ try {
     $sourceRenderer = Join-Path $output 'dxil-source-render.exe'
     Invoke-Checked zig @('c++', 'tests/dxil/validate.cpp', $hashSource, '-std=c++23', '-fms-extensions', '-Wall', '-Wextra', '-Werror', '-isystem', $DxcInclude, '-lole32', '-O2', '-o', $validator)
     Invoke-Checked zig @('c++', 'tests/dxil/render.cpp', '-std=c++23', '-fms-extensions', '-Wall', '-Wextra', '-Werror', '-ld3d12', '-ldxgi', '-ldxguid', '-O2', '-o', $renderer)
-    Invoke-Checked zig @('c++', 'tests/dxil/source_render.cpp', 'zig-out/lib/glsl2hlsl.lib', '-Iinclude', '-std=c++23', '-fms-extensions', '-Wall', '-Wextra', '-Werror', '-ld3d12', '-ldxgi', '-ldxguid', '-O2', '-o', $sourceRenderer)
+    Invoke-Checked zig @('c++', 'tests/dxil/source_render.cpp', 'zig-out/lib/glsl2hlsl.lib', '-Iinclude', "-DGLSL2HLSL_TEST_AGILITY=$($baseline.agility.sdkVersion)", '-std=c++23', '-fms-extensions', '-Wall', '-Wextra', '-Werror', '-ld3d12', '-ldxgi', '-ldxguid', '-O2', '-o', $sourceRenderer)
     $library = Get-ChildItem -LiteralPath (Join-Path $root 'zig-out/dxil-shared') -Filter '*glsl2hlsl*.dll' -Recurse -File | Select-Object -First 1
     if (-not $library) { throw 'shared library missing' }
     $imports = @{}
@@ -122,6 +144,7 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "disassembly failed: $shader" }
         [IO.File]::WriteAllLines("$shader.ll", [string[]]$listing)
     }
+    $modernOutput = @()
     $mode = Get-ItemProperty -LiteralPath HKLM:/SOFTWARE/Microsoft/Windows/CurrentVersion/AppModelUnlock -ErrorAction SilentlyContinue
     $developerMode = $null -ne $mode -and $mode.AllowDevelopmentWithoutDevLicense -eq 1
     if (-not $SkipHardware) {
@@ -143,12 +166,34 @@ try {
         $coordinateReference | Write-Output
         if ($referenceStatus -ne 0) { throw 'independent HLSL coordinate reference failed' }
         [IO.File]::WriteAllLines((Join-Path $output 'reference-source-render.txt'), [string[]]$coordinateReference)
+        $modernOutput = & $sourceRenderer --m3
+        $modernStatus = $LASTEXITCODE
+        [IO.File]::WriteAllLines((Join-Path $output 'm3-render.txt'), [string[]]$modernOutput)
+        $modernOutput | Where-Object { $_ -match 'adapter=|sm69=|m3_|source_hardware' } | Write-Output
+        if ($modernStatus -ne 0) { throw 'M3 same-source hardware comparison failed' }
     }
     $sourceShaders = @(Get-ChildItem -LiteralPath (Join-Path $output 'm2') -Filter '*.dxil' -File | Sort-Object Name)
     $sourceValidation = & $validator $compilerDll (Join-Path $output 'retail-vectors.bin') @($sourceShaders.FullName)
     $sourceValidation | Write-Output
     if ($LASTEXITCODE -ne 0) { throw 'M2 official validation failed' }
     [IO.File]::WriteAllLines((Join-Path $output 'source-validation.txt'), [string[]]$sourceValidation)
+    $modernShaders = @(foreach ($directory in @('m3', 'm3-heap')) { Get-ChildItem -LiteralPath (Join-Path $output $directory) -Filter '*.dxil' -File | Sort-Object Name })
+    $modernValidation = & $validator $compilerDll (Join-Path $output 'retail-vectors.bin') @($modernShaders.FullName)
+    [IO.File]::WriteAllLines((Join-Path $output 'm3-validation.txt'), [string[]]$modernValidation)
+    if ($LASTEXITCODE -ne 0) { $modernValidation | Write-Output; throw 'M3 official validation failed' }
+    foreach ($reflection in @(Get-ChildItem -LiteralPath (Join-Path $output 'm2') -Filter '*.reflection.json' -File)) {
+        $expected = [IO.File]::ReadAllText($reflection.FullName)
+        foreach ($directory in @('m3', 'm3-heap')) {
+            $actual = [IO.File]::ReadAllText((Join-Path (Join-Path $output $directory) $reflection.Name))
+            if ($actual -cne $expected) { throw "SM6.5/6.9 reflection mismatch: $directory/$($reflection.Name)" }
+        }
+    }
+    $vectorListing = & $Dxc -dumpbin (Join-Path $output 'm3/vectors.frag.dxil')
+    if ($LASTEXITCODE -ne 0) { throw 'native vector disassembly failed' }
+    foreach ($pattern in @('fadd <2 x float>', 'fmul <3 x float>', 'fdiv <4 x float>', 'shl <4 x i32>', 'xor <4 x i32>')) {
+        if (-not ($vectorListing | Select-String -SimpleMatch $pattern)) { throw "missing native vector instruction: $pattern" }
+    }
+    [IO.File]::WriteAllLines((Join-Path $output 'm3/vectors.frag.dxil.ll'), [string[]]$vectorListing)
     $report = [ordered]@{
         timestampUtc = [DateTime]::UtcNow.ToString('o')
         zig = $zigVersion
@@ -162,11 +207,21 @@ try {
         sourceBenchmark = @($sourceBenchmark)
         m2 = [ordered]@{
             corpusFiles = 10
-            pairedCorpusScenarios = 9
+            pairedCorpusScenarios = 10
             validatedBinaries = $sourceShaders.Count
             coordinateCombinationsPerAdapter = if ($SkipHardware) { 0 } else { 96 }
             hardware = if ($SkipHardware) { 'not run; M2 acceptance incomplete' } else { 'passed with independent CPU and HLSL coordinate oracles' }
             artifacts = @($sourceShaders | Get-FileHash -Algorithm SHA256 | Select-Object Path, Hash)
+        }
+        m3 = [ordered]@{
+            target = $baseline.m3Target
+            agility = $baseline.agility
+            validatedBinaries = $modernShaders.Count
+            reflectionComparisons = 20
+            nativeVectorWidths = @(2, 3, 4)
+            hardware = if ($SkipHardware) { 'not run; M3 acceptance incomplete' } else { 'passed; same-source resources, layouts, signatures, all pixels and depth compared across SM6.5, SM6.9 tables and SM6.9 heaps on supported adapters' }
+            capabilities = @($modernOutput | Where-Object { $_ -match 'adapter=|sm69=|m3_|source_hardware' })
+            artifacts = @($modernShaders | Get-FileHash -Algorithm SHA256 | Select-Object Path, Hash)
         }
         peImports = $imports
         os = [Environment]::OSVersion.VersionString
@@ -174,7 +229,7 @@ try {
         fixtures = @(Get-FileHash -LiteralPath $vertex, $fragment, $alternate, $referenceVertex, $referenceFragment -Algorithm SHA256 | Select-Object Path, Hash)
     }
     $report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $output 'report.json') -Encoding utf8
-    if ($SkipHardware) { Write-Warning 'hardware skipped; M1/M2 are not fully accepted' }
+    if ($SkipHardware) { Write-Warning 'hardware skipped; M1/M2/M3 are not fully accepted' }
     Write-Output "DXIL report: $output/report.json"
 } finally {
     Pop-Location

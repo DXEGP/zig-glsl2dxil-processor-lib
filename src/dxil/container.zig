@@ -11,7 +11,8 @@ pub const compat = @import("compat.zig");
 
 pub const Program = module.Program;
 pub const retailHash = hash.retail;
-pub const Target = enum { sm65, sm69 };
+pub const targets = @import("target.zig");
+pub const Target = targets.Target;
 pub const Error = error{ OutOfMemory, UnsupportedTarget };
 pub const ParseError = error{ InvalidContainer, InvalidHash, MissingPart };
 
@@ -30,7 +31,7 @@ const Buffer = struct {
     }
 };
 
-fn signature(allocator: std.mem.Allocator, elements: []const ir.Signature, input: bool) ![]u8 {
+fn signature(allocator: std.mem.Allocator, elements: []const ir.Signature, input: bool, target: Target) ![]u8 {
     var buffer: Buffer = .{ .allocator = allocator };
     try buffer.word(@intCast(elements.len));
     try buffer.word(8);
@@ -41,8 +42,8 @@ fn signature(allocator: std.mem.Allocator, elements: []const ir.Signature, input
         order[index] = index;
         offsets[index] = string_offset;
         var shared = false;
-        if (element.semantic != .arbitrary) for (elements[0..index], 0..) |previous, earlier| {
-            if (previous.semantic == element.semantic) {
+        if (target == .sm69 or element.semantic != .arbitrary) for (elements[0..index], 0..) |previous, earlier| {
+            if (std.mem.eql(u8, previous.name, element.name)) {
                 offsets[index] = offsets[earlier];
                 shared = true;
                 break;
@@ -88,6 +89,7 @@ fn signature(allocator: std.mem.Allocator, elements: []const ir.Signature, input
         try buffer.append(&.{0});
         next_string += @intCast(element.name.len + 1);
     }
+    if (target == .sm69) while (buffer.data.items.len % 4 != 0) try buffer.append(&.{0});
     return buffer.data.toOwnedSlice(allocator);
 }
 
@@ -101,10 +103,11 @@ fn psvElement(buffer: *Buffer, name_offset: u32, index_offset: u32, element: ir.
     }, element.interpolation, 0, 0 });
 }
 
-fn psv(allocator: std.mem.Allocator, shader: *const ir.Module, analysis: encode.Analysis) ![]u8 {
+fn psv(allocator: std.mem.Allocator, shader: *const ir.Module, analysis: encode.Analysis, target: Target) ![]u8 {
     var buffer: Buffer = .{ .allocator = allocator };
     const vertex = shader.stage == .vertex;
-    var runtime: [36]u8 = @splat(0);
+    var storage: [52]u8 = @splat(0);
+    const runtime = storage[0..if (target == .sm65) @as(usize, 36) else 52];
     for (analysis.outputs) |element| if ((vertex and element.semantic == .position) or (!vertex and element.semantic == .depth)) {
         runtime[0] = 1;
     };
@@ -114,11 +117,12 @@ fn psv(allocator: std.mem.Allocator, shader: *const ir.Module, analysis: encode.
     runtime[29] = @intCast(analysis.outputs.len);
     runtime[31] = @intCast(encode.vectorCount(analysis.inputs));
     runtime[32] = @intCast(encode.vectorCount(analysis.outputs));
-    try buffer.word(runtime.len);
-    try buffer.append(&runtime);
+    try buffer.word(@intCast(runtime.len));
+    const runtime_offset = buffer.data.items.len;
+    try buffer.append(runtime);
     try buffer.word(@intCast(shader.resources.items.len));
     if (shader.resources.items.len > 0) {
-        try buffer.word(16);
+        try buffer.word(if (target == .sm65) 16 else 24);
         for ([_]@FieldType(ir.Resource, "class"){ .cbuffer, .sampler, .srv, .uav }) |resource_class| for (shader.resources.items) |resource| {
             if (resource.class != resource_class) continue;
             try buffer.word(switch (resource.class) {
@@ -130,6 +134,15 @@ fn psv(allocator: std.mem.Allocator, shader: *const ir.Module, analysis: encode.
             try buffer.word(resource.space);
             try buffer.word(resource.binding);
             try buffer.word(resource.binding);
+            if (target == .sm69) {
+                try buffer.word(switch (resource.class) {
+                    .cbuffer => 13,
+                    .sampler => 14,
+                    .srv => 2,
+                    .uav => unreachable,
+                });
+                try buffer.word(0);
+            }
         };
     }
     var strings: Buffer = .{ .allocator = allocator };
@@ -144,6 +157,10 @@ fn psv(allocator: std.mem.Allocator, shader: *const ir.Module, analysis: encode.
         }
         try indices.append(allocator, element.index);
     };
+    if (target == .sm69) {
+        std.mem.writeInt(u32, buffer.data.items[runtime_offset + 48 ..][0..4], @intCast(strings.data.items.len), .little);
+        try strings.append("main\x00");
+    }
     while (strings.data.items.len % 4 != 0) try strings.append(&.{0});
     try buffer.word(@intCast(strings.data.items.len));
     try buffer.append(strings.data.items);
@@ -163,7 +180,6 @@ fn psv(allocator: std.mem.Allocator, shader: *const ir.Module, analysis: encode.
 }
 
 pub fn emit(allocator: std.mem.Allocator, program: Program, target: Target) Error![]u8 {
-    if (target != .sm65) return error.UnsupportedTarget;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     var shader = try module.build(arena.allocator(), program);
@@ -173,29 +189,31 @@ pub fn emit(allocator: std.mem.Allocator, program: Program, target: Target) Erro
     };
 }
 
-pub fn emitModule(allocator: std.mem.Allocator, shader: *const ir.Module, target: Target) (Error || error{InvalidIr})![]u8 {
-    if (target != .sm65) return error.UnsupportedTarget;
+pub fn emitModule(allocator: std.mem.Allocator, source: *const ir.Module, target: Target) (Error || error{InvalidIr})![]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const scratch = arena.allocator();
-    try shader.verify(scratch);
+    var legalized = try targets.legalize(scratch, source, target);
+    const shader = &legalized;
     const vertex = shader.stage == .vertex;
     const analysis = try encode.analyze(scratch, shader);
-    const bitcode = try encode.emit(scratch, shader, analysis);
+    const bitcode = try encode.emit(scratch, shader, analysis, target);
     var dxil: Buffer = .{ .allocator = scratch };
-    try dxil.word((@as(u32, @intFromBool(vertex)) << 16) | 0x65);
+    try dxil.word((@as(u32, @intFromBool(vertex)) << 16) | 0x60 | target.minor());
     try dxil.word(@intCast(6 + bitcode.len / 4));
     try dxil.append("DXIL");
-    try dxil.word(0x105);
+    try dxil.word(0x100 | target.minor());
     try dxil.word(16);
     try dxil.word(@intCast(bitcode.len));
     try dxil.append(bitcode);
     const kinds = [_][]const u8{ "SFI0", "ISG1", "OSG1", "PSV0", "DXIL" };
+    var features: [8]u8 = undefined;
+    std.mem.writeInt(u64, &features, targets.requirements(shader, target).feature_flags, .little);
     const parts = [_][]const u8{
-        &@as([8]u8, @splat(0)),
-        try signature(scratch, analysis.inputs, true),
-        try signature(scratch, analysis.outputs, false),
-        try psv(scratch, shader, analysis),
+        &features,
+        try signature(scratch, analysis.inputs, true, target),
+        try signature(scratch, analysis.outputs, false, target),
+        try psv(scratch, shader, analysis, target),
         dxil.data.items,
     };
     var output: Buffer = .{ .allocator = allocator };
@@ -271,7 +289,10 @@ test "container rejects truncated tables overlapping parts and corrupt digests" 
     bytes[4] ^= 1;
     std.mem.writeInt(u32, bytes[32..36], 0, .little);
     try std.testing.expectError(error.InvalidContainer, validate(bytes));
-    try std.testing.expectError(error.UnsupportedTarget, emit(std.testing.allocator, .vertex_passthrough, .sm69));
+    const modern = try emit(std.testing.allocator, .vertex_passthrough, .sm69);
+    defer std.testing.allocator.free(modern);
+    try std.testing.expectEqual(@as(u32, 0x109), word(try getPart(modern, "DXIL"), 12));
+    try std.testing.expectEqual(@as(u32, 52), word(try getPart(modern, "PSV0"), 0));
 }
 
 fn allocationTest(allocator: std.mem.Allocator) !void {

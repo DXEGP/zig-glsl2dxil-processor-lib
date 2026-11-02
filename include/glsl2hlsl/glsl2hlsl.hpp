@@ -125,6 +125,10 @@ enum class Coordinates {
     OpenGL = GLSL2HLSL_DXIL_OPENGL,
     D3D12Native = GLSL2HLSL_DXIL_D3D12_NATIVE
 };
+enum class BindingMode {
+    DescriptorTables = GLSL2HLSL_DXIL_DESCRIPTOR_TABLES,
+    DirectHeap = GLSL2HLSL_DXIL_DIRECT_HEAP
+};
 
 struct GraphicsRequest {
     std::string_view vertex;
@@ -133,6 +137,9 @@ struct GraphicsRequest {
     std::string_view fragment_name = "fragment";
     glsl2hlsl_shader_model shader_model = GLSL2HLSL_SM_6_5;
     Coordinates coordinates = Coordinates::OpenGL;
+    BindingMode binding_mode = BindingMode::DescriptorTables;
+    std::uint32_t resource_heap_base = 0;
+    std::uint32_t sampler_heap_base = 0;
 };
 
 class GraphicsResult {
@@ -158,6 +165,12 @@ public:
     [[nodiscard]] std::span<const std::uint8_t> fragment() const noexcept { return {value_.fragment, value_.fragment_length}; }
     [[nodiscard]] const glsl2hlsl_dxil_graphics_result &reflection() const noexcept { return value_; }
     [[nodiscard]] std::span<const glsl2hlsl_dxil_graphics_diagnostic> diagnostics() const noexcept { return {value_.diagnostics, value_.diagnostic_count}; }
+    [[nodiscard]] glsl2hlsl_dxil_execution_info execution_info() const noexcept {
+        glsl2hlsl_dxil_execution_info info{};
+        const auto status = glsl2hlsl_dxil_graphics_execution_info(&value_, &info);
+        if (status != GLSL2HLSL_STATUS_OK) return {};
+        return info;
+    }
 
     friend GraphicsResult compile_graphics(const GraphicsRequest &) noexcept;
 };
@@ -175,7 +188,13 @@ public:
     options.shader_model = request.shader_model;
     options.coordinates = static_cast<glsl2hlsl_dxil_coordinates>(std::to_underlying(request.coordinates));
     GraphicsResult result;
-    result.value_.status = glsl2hlsl_dxil_compile_graphics(&options, &result.value_);
+    glsl2hlsl_dxil_graphics_options_ex extended{};
+    extended.struct_size = sizeof(extended);
+    extended.base = options;
+    extended.binding_mode = static_cast<glsl2hlsl_dxil_binding_mode>(std::to_underlying(request.binding_mode));
+    extended.resource_heap_base = request.resource_heap_base;
+    extended.sampler_heap_base = request.sampler_heap_base;
+    result.value_.status = glsl2hlsl_dxil_compile_graphics_ex(&extended, &result.value_);
     return result;
 }
 

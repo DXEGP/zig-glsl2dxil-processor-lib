@@ -234,6 +234,47 @@ typedef struct glsl2hlsl_dxil_graphics_result {
 
 GLSL2HLSL_API void glsl2hlsl_dxil_graphics_result_free(glsl2hlsl_dxil_graphics_result *result);
 
+typedef enum glsl2hlsl_dxil_binding_mode {
+    GLSL2HLSL_DXIL_DESCRIPTOR_TABLES = 0,
+    GLSL2HLSL_DXIL_DIRECT_HEAP = 1
+} glsl2hlsl_dxil_binding_mode;
+
+typedef struct glsl2hlsl_dxil_graphics_options_ex {
+    size_t struct_size;
+    glsl2hlsl_dxil_graphics_options base;
+    glsl2hlsl_dxil_binding_mode binding_mode;
+    uint32_t resource_heap_base;
+    uint32_t sampler_heap_base;
+} glsl2hlsl_dxil_graphics_options_ex;
+
+typedef struct glsl2hlsl_dxil_heap_binding {
+    uint32_t binding_index;
+    uint32_t heap_index;
+} glsl2hlsl_dxil_heap_binding;
+
+typedef struct glsl2hlsl_dxil_execution_info {
+    uint32_t shader_model;
+    uint32_t dxil_version;
+    uint32_t validator_version;
+    uint32_t psv_version;
+    uint32_t resource_binding_tier;
+    uint32_t root_signature_version;
+    uint32_t root_flags;
+    uint32_t native_vectors;
+    uint64_t feature_flags;
+    glsl2hlsl_dxil_binding_mode binding_mode;
+    const glsl2hlsl_dxil_heap_binding *heap_bindings;
+    size_t heap_binding_count;
+} glsl2hlsl_dxil_execution_info;
+
+[[nodiscard]] GLSL2HLSL_API glsl2hlsl_status glsl2hlsl_dxil_compile_graphics_ex(
+    const glsl2hlsl_dxil_graphics_options_ex *options,
+    glsl2hlsl_dxil_graphics_result *result);
+
+[[nodiscard]] GLSL2HLSL_API glsl2hlsl_status glsl2hlsl_dxil_graphics_execution_info(
+    const glsl2hlsl_dxil_graphics_result *result,
+    glsl2hlsl_dxil_execution_info *info);
+
 typedef enum glsl2hlsl_dxil_clip_origin {
     GLSL2HLSL_DXIL_LOWER_LEFT = 0,
     GLSL2HLSL_DXIL_UPPER_LEFT = 1

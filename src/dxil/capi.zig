@@ -25,6 +25,22 @@ pub const Options = extern struct {
     shader_model: c_int,
     coordinates: c_int,
 };
+pub const OptionsEx = extern struct { struct_size: usize, base: Options, binding_mode: u32, resource_heap_base: u32, sampler_heap_base: u32 };
+pub const HeapBinding = extern struct { binding_index: u32, heap_index: u32 };
+pub const ExecutionInfo = extern struct {
+    shader_model: u32 = 0,
+    dxil_version: u32 = 0,
+    validator_version: u32 = 0,
+    psv_version: u32 = 0,
+    resource_binding_tier: u32 = 0,
+    root_signature_version: u32 = 0,
+    root_flags: u32 = 0,
+    native_vectors: u32 = 0,
+    feature_flags: u64 = 0,
+    binding_mode: u32 = 0,
+    heap_bindings: ?[*]const HeapBinding = null,
+    heap_binding_count: usize = 0,
+};
 pub const Result = extern struct {
     status: c_int = 0,
     owner: ?*anyopaque = null,
@@ -45,7 +61,7 @@ pub const Result = extern struct {
     diagnostics: ?[*]const Diagnostic = null,
     diagnostic_count: usize = 0,
 };
-const Owner = struct { arena: std.heap.ArenaAllocator, result: ?graphics.GraphicsResult = null };
+const Owner = struct { arena: std.heap.ArenaAllocator, result: ?graphics.GraphicsResult = null, execution: ExecutionInfo = .{} };
 
 pub fn free(result: ?*Result) void {
     const value = result orelse return;
@@ -71,6 +87,34 @@ fn convertType(typ: sema.Type) Type {
 }
 
 pub fn compile(request: ?*const Options, out_result: ?*Result) c_int {
+    return compileImpl(request, out_result, .descriptor_tables, .{});
+}
+
+pub fn compileEx(request: ?*const OptionsEx, out_result: ?*Result) c_int {
+    const result = out_result orelse return 3;
+    result.* = .{};
+    const options = request orelse {
+        result.status = 3;
+        return 3;
+    };
+    if (options.struct_size != @sizeOf(OptionsEx) or options.binding_mode > 1) {
+        result.status = 3;
+        return 3;
+    }
+    return compileImpl(&options.base, result, if (options.binding_mode == 0) .descriptor_tables else .direct_heap, .{ .resource_base = options.resource_heap_base, .sampler_base = options.sampler_heap_base });
+}
+
+pub fn executionInfo(result: ?*const Result, output: ?*ExecutionInfo) c_int {
+    const info = output orelse return 3;
+    info.* = .{};
+    const value = result orelse return 3;
+    if (value.status != 0 or value.owner == null) return 3;
+    const owner: *const Owner = @ptrCast(@alignCast(value.owner.?));
+    info.* = owner.execution;
+    return 0;
+}
+
+fn compileImpl(request: ?*const Options, out_result: ?*Result, binding_mode: graphics.targets.BindingMode, heap_layout: graphics.targets.HeapLayout) c_int {
     const result = out_result orelse return 3;
     result.* = .{};
     const options = request orelse {
@@ -81,10 +125,6 @@ pub fn compile(request: ?*const Options, out_result: ?*Result) c_int {
         result.status = 3;
         return 3;
     }
-    if (options.shader_model == 69) {
-        result.status = 4;
-        return 4;
-    }
     const owner = allocator.create(Owner) catch return outOfMemory(result);
     owner.* = .{ .arena = std.heap.ArenaAllocator.init(allocator) };
     result.owner = owner;
@@ -94,6 +134,9 @@ pub fn compile(request: ?*const Options, out_result: ?*Result) c_int {
         .vertex = .{ .source = slice(options.vertex_source, options.vertex_source_length), .name = slice(options.vertex_name, options.vertex_name_length) },
         .fragment = .{ .source = slice(options.fragment_source, options.fragment_source_length), .name = slice(options.fragment_name, options.fragment_name_length) },
         .coordinates = if (options.coordinates == 0) .opengl else .d3d12_native,
+        .target = if (options.shader_model == 65) .sm65 else .sm69,
+        .binding_mode = binding_mode,
+        .heap_layout = heap_layout,
     }, &diagnostics) catch |err| switch (err) {
         error.OutOfMemory => return outOfMemory(result),
         error.UnsupportedTarget => {
@@ -106,6 +149,10 @@ pub fn compile(request: ?*const Options, out_result: ?*Result) c_int {
     copyDiagnostics(scratch, diagnostics.items.items, result) catch return outOfMemory(result);
     if (owner.result) |*compiled| {
         copyReflection(scratch, compiled.reflection, result) catch return outOfMemory(result);
+        const requirements = compiled.reflection.requirements;
+        const heap_bindings = scratch.alloc(HeapBinding, compiled.reflection.heap_bindings.len) catch return outOfMemory(result);
+        for (heap_bindings, compiled.reflection.heap_bindings) |*destination, source| destination.* = .{ .binding_index = source.binding_index, .heap_index = source.heap_index };
+        owner.execution = .{ .shader_model = requirements.shader_model, .dxil_version = requirements.dxil_version, .validator_version = requirements.validator_version, .psv_version = requirements.psv_version, .resource_binding_tier = requirements.resource_binding_tier, .root_signature_version = requirements.root_signature_version, .root_flags = requirements.root_flags, .feature_flags = requirements.feature_flags, .native_vectors = @intFromBool(requirements.native_vectors), .binding_mode = @backingInt(compiled.reflection.binding_mode), .heap_bindings = if (heap_bindings.len == 0) null else heap_bindings.ptr, .heap_binding_count = heap_bindings.len };
         result.vertex = compiled.vertex.ptr;
         result.vertex_length = compiled.vertex.len;
         result.fragment = compiled.fragment.ptr;

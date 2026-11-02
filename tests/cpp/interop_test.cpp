@@ -40,6 +40,22 @@ int main() {
     glsl2hlsl::GraphicsResult assigned;
     assigned = std::move(moved);
     if (moved || !assigned || assigned.vertex().data() != original) failures = report("graphics move assignment failed", failures);
+    auto modern = glsl2hlsl::compile_graphics({
+        .vertex = "layout(location=0) in vec4 p; void main(){gl_Position=p*2.0;}",
+        .fragment = "uniform vec4 tint; out vec4 c; void main(){c=tint+vec4(0.25);}",
+        .shader_model = GLSL2HLSL_SM_6_9,
+        .coordinates = glsl2hlsl::Coordinates::D3D12Native,
+        .binding_mode = glsl2hlsl::BindingMode::DirectHeap,
+        .resource_heap_base = 7
+    });
+    if (!modern) failures = report("SM6.9 heap compilation failed", failures);
+    else {
+        const auto info = modern.execution_info();
+        if (info.shader_model != 69 || !info.native_vectors || info.root_flags != 0x400 || info.heap_binding_count != 1 || info.heap_bindings[0].heap_index != 7)
+            failures = report("SM6.9 execution requirements mismatch", failures);
+        auto moved_modern = std::move(modern);
+        if (modern || moved_modern.execution_info().heap_bindings != info.heap_bindings) failures = report("heap reflection move failed", failures);
+    }
 
     constexpr std::string_view vertex_source =
         "#version 330 core\n"

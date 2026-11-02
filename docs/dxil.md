@@ -1,6 +1,6 @@
-# DXIL 后端：M0/M1 基线与 M2 源码编译
+# DXIL 后端：M0–M3 源码编译与验收
 
-本页记录方案 A 的 M0/M1 基线与 M2 配对 GLSL 编译。核心实现使用 Zig 0.17.0，目标为 SM 6.5 / DXIL 1.5；SM 6.9 留待 M3。M1 的低层程序接口继续可用，M2 新增独立的语义、SSA、资源反射及 GL 状态路径。原有 GLSL→HLSL 接口继续使用原管线。
+本页记录方案 A 的 M0/M1 基线、M2 配对 GLSL 编译及 M3 双目标后端。核心实现使用 Zig 0.17.0，支持 SM 6.5 / DXIL 1.5 与 SM 6.9 / DXIL 1.9。M1 低层程序接口和原有 GLSL→HLSL 接口继续可用。
 
 ## M0：固定参考与支持矩阵
 
@@ -15,7 +15,7 @@
 | 能力 | M1 已实现 | 后续边界 |
 | --- | --- | --- |
 | 程序输入 | `vertex_passthrough`、`fragment_constant: [4]f32` | GLSL 语义分析和 SSA 属于 M2 |
-| 目标 | SM 6.5、DXIL 1.5、validator 兼容版本 1.5、PSV v1 | 请求 SM 6.9 返回 `UnsupportedTarget` |
+| 目标 | SM 6.5、DXIL 1.5、validator 兼容版本 1.5、PSV v1 | M3 增加 SM 6.9 / DXIL 1.9 / PSV v3 |
 | 顶点接口 | `POSITION0: float4` → `SV_Position: float4` | 尚无任意用户 signature、跨阶段链接 |
 | 片元接口 | 无输入；`SV_Target0: float4` | 尚无纹理、uniform、MRT、discard |
 | 控制流与计算 | 单基本块、loadInput/storeOutput、常量 | 尚无一般算术、用户函数和循环 |
@@ -34,7 +34,7 @@ SM 6.5 路径后续使用描述符表，不发射 SM 6.6 才支持的 `createHan
 
 `src/dxil/bitstream.zig` 写入低位优先位流、VBR、32 位对齐、嵌套块长度和未缩写记录。`module.zig` 将 M1 程序构造为一般 IR，`encode.zig` 生成类型表、属性、函数声明、常量、元数据、符号表及函数体，输出真实 LLVM 3.7 Bitcode；不读取或拼接预编译 DXIL。
 
-`container.zig` 生成各 Part 和偏移表，设置 SM/DXIL 版本，再用 `hash.zig` 计算从容器偏移 `0x14` 到末尾的 Retail 摘要并回填 `0x04`。这是格式摘要，不能替代官方语义验证。签名 Part 的字符串长度保留实际长度，不能任意追加会导致官方重建比较不一致的填充。
+`container.zig` 生成各 Part 和偏移表，设置 SM/DXIL 版本，再用 `hash.zig` 计算从容器偏移 `0x14` 到末尾的 Retail 摘要并回填 `0x04`。这是格式摘要，不能替代官方语义验证。validator 1.5 的签名 Part 保留实际字符串长度；1.9 对名称按内容去重并补齐到 4 字节。
 
 | 字段 | M1 值 |
 | --- | --- |
@@ -62,7 +62,7 @@ defer allocator.free(bytes);
 
 `glsl2hlsl_dxil_emit` 接受 `glsl2hlsl_dxil_options`，包括程序种类、目标 SM 和 RGBA；顶点透传忽略 RGBA。成功返回独立的 `uint8_t*` 和字节长度。调用方用 `glsl2hlsl_dxil_result_free` 释放；释放后归零，可重复释放和传空指针。重复使用结果结构前必须先释放已有结果。
 
-请求 SM 6.9 返回 `GLSL2HLSL_STATUS_UNSUPPORTED_TARGET`，其他未知目标/程序枚举或空参数返回 `INVALID_ARGUMENT`。失败不返回字节码。原有状态值和文本 API 的 ABI 保持不变；新增状态值为 4。M1 不增加 C++ 专用包装，C++23/26 可直接使用 C ABI。
+M1 发射接口接受 SM 6.5 和 SM 6.9。未知目标/程序枚举或空参数返回 `INVALID_ARGUMENT`。失败不返回字节码。原有状态值和文本 API 的 ABI 保持不变；`UNSUPPORTED_TARGET` 为 4。M1 不增加 C++ 专用包装，C++23/26 可直接使用 C ABI。
 
 ## 构建与验收
 
@@ -129,7 +129,7 @@ pwsh -NoProfile -File tests/dxil/run.ps1
 | 内置变量 | Position、VertexID、InstanceID、FragCoord、FrontFacing、FragDepth、旧版 FragColor |
 | 限制 | 单阶段源码 1 MiB、262144 token、语法/表达式嵌套计数上限 256、结构体深度 64、4096 基本块、内联深度 32、单个局部聚合最多 16384 分量、Globals 最大 64 KiB |
 
-函数重载、递归、重叠 out/inout 写回、sampler 数组、动态局部写索引、UBO/SSBO、其他纹理种类、导数、double、其他 shader 阶段与 SM 6.9 尚不支持。预处理沿用现有子集，不增加 include/VFS。宏展开保持行号，诊断列是展开后 token 位置；不提供宏调用栈或 `#line` 文件重映射。浮点算术不设置 fast-math；未承诺跨设备逐位浮点一致性。
+函数重载、递归、重叠 out/inout 写回、sampler 数组、非一致资源索引、动态局部写索引、UBO/SSBO、其他纹理种类、导数、double 和其他 shader 阶段尚不支持。预处理沿用现有子集，不增加 include/VFS。宏展开保持行号，诊断列是展开后 token 位置；不提供宏调用栈或 `#line` 文件重映射。浮点算术不设置 fast-math；未承诺跨设备逐位浮点一致性。
 
 ### Zig 与 C/C++ 所有权
 
@@ -147,7 +147,7 @@ defer result.deinit();
 
 结果 arena 拥有字节码和反射；所有视图在 `deinit` 后失效。诊断使用独立的调用方 allocator，失败后仍可读取。可选 `GraphicsRequest.measurement` 接受带 `std.Io` 的 `Measurement`，记录前端、语义检查、lower 和编码耗时；默认不读取时钟。
 
-C 使用 `glsl2hlsl_dxil_graphics_options`，必须设置 `shader_model=GLSL2HLSL_SM_6_5`。源码/名称是借用的指针与长度，函数返回后可释放。空指针配非零长度、无效枚举或空输出参数返回 INVALID_ARGUMENT；SM 6.9 返回 UNSUPPORTED_TARGET；编译诊断返回 INVALID_SHADER。
+C 使用 `glsl2hlsl_dxil_graphics_options`，设置 `shader_model=GLSL2HLSL_SM_6_5` 或 `GLSL2HLSL_SM_6_9`。源码/名称是借用的指针与长度，函数返回后可释放。空指针配非零长度、无效枚举或空输出参数返回 INVALID_ARGUMENT；SM 6.5 请求堆直接索引返回 UNSUPPORTED_TARGET；编译诊断返回 INVALID_SHADER。
 
 `glsl2hlsl_dxil_graphics_result` 的 owner 拥有两份二进制、反射、以零结尾的名字和诊断消息；也返回显式长度。失败时仅保留诊断，不返回部分字节码/反射。用 `glsl2hlsl_dxil_graphics_result_free` 释放，它支持空指针及重复释放并归零结果；重复编译到同一结果前先释放。不可复制 owner 后分别释放。C++ `compile_graphics`/`GraphicsResult` 自动执行这一协议，支持 noexcept 移动，禁止复制；参见 [C++ 文档](cpp-api.md#dxil-配对源码接口)。
 
@@ -180,11 +180,11 @@ base_instance 仅用于宿主起始实例，GlCompat 第五个 word 为 0；SM 6
 
 ### M2 验收与性能
 
-`zig build dxil-source-fixtures` 输出既有 10 个 shader 的 8 个配对场景及一个 native 基础场景，共 18 个容器与 JSON 反射。`tests/dxil/source_render.cpp` 通过公开 C ABI现场编译，按反射绑定资源；每个硬件适配器逐像素检查 16×16 浮点 RT 和相关深度值，包括两张非对称纹理、显式 mip、MRT、discard、结构体分支、非对称矩阵、循环/短路/提前返回/回写。
+`zig build dxil-source-fixtures` 输出既有 10 个 shader 的 8 个配对场景、native 基础场景和向量场景，每种目标/绑定配置共 20 个容器及 JSON 反射。`tests/dxil/source_render.cpp` 通过公开 C ABI 现场编译，按反射绑定资源；每个硬件适配器逐像素检查 16×16 浮点 RT 和相关深度值，包括两张非对称纹理、显式 mip、MRT、discard、结构体分支、非对称矩阵、循环/短路/提前返回/回写。
 
 GL 验收矩阵为 2 origins × 2 clip depths × 3 depth ranges × 2 windings × 2 base instances × 2 viewports＝96 组；另测裁剪体积外、正面剔除、零/负 w。CPU 公式提供期望值，独立 HLSL 坐标程序经 DXC 编译后重复相同断言。每个渲染进程都检查调试层错误和编译 DLL 缺席。完整 `run.ps1` 同时保留 M1 验收，官方 validator 原样检查全部新产物并拒绝损坏签名；报告将硬件跳过明确标记为未完成。
 
-`zig build dxil-source-bench -Doptimize=ReleaseSafe` 对 triangle/showcase 分别测首次和 101 次无缓存配对编译，报告总时间 P50/P95/P99、各阶段 P50、请求内存峰值及产物大小。计数 allocator 禁用原地 resize/remap，峰值反映该分配策略，不等同进程 RSS。读取源码在计时外，释放、文件 I/O、官方验证和 PSO 不计入编译时间；不设置亚毫秒门槛。M2 的通过不代表完整 GLSL、Minecraft/Iris 包或 SM 6.9 已可用。
+`zig build dxil-source-bench -Doptimize=ReleaseSafe` 对 triangle/showcase 分别测首次和 101 次无缓存配对编译，报告总时间 P50/P95/P99、各阶段 P50、请求内存峰值及产物大小。计数 allocator 禁用原地 resize/remap，峰值反映该分配策略，不等同进程 RSS。读取源码在计时外，释放、文件 I/O、官方验证和 PSO 不计入编译时间；不设置亚毫秒门槛。M2 的通过不代表完整 GLSL 或 Minecraft/Iris 包已可用；M3 验收单独记录。
 
 2026-11-02 的 M2 验收使用上述 DXC/validator 和两块硬件，Developer Mode 关闭、调试层开启：
 
@@ -199,3 +199,36 @@ GL 验收矩阵为 2 origins × 2 clip depths × 3 depth ranges × 2 windings ×
 | 无缓存源码基准 | triangle/showcase 配对 P50 为 0.1923/0.2585 ms，请求内存峰值 346520/551746 字节；仅代表本次机器和语料 |
 
 重跑报告为 `zig-out/dxil/report.json`，明细日志为 `source-validation.txt`、`source-render.txt`、`reference-source-render.txt` 和 `source-benchmark.txt`。生成物随适配器数量与语料增加而变化，不能把 74 当固定覆盖率要求。
+
+## M3：SM 6.9 合法化与宿主要求
+
+`target.zig` 集中管理目标与执行要求。SM 6.5 保持标量化与传统 `createHandle`；SM 6.9 使用 DXIL/validator 1.9、PSV v3（52 字节 RuntimeInfo、24 字节资源记录、入口名称），把描述符表句柄改写为 `createHandleFromBinding` + `annotateHandle`。`SFI0` 与入口 shader flags 按实际使用的堆生成，默认描述符表不会要求直接索引标志。
+
+GLSL 的 2/3/4 分量 float/int/uint 向量算术在 SM 6.9 中生成原生向量二元指令；矩阵乘法、比较、转换和现有内置函数继续使用已支持的标量实现。LLVM insertelement/extractelement 连接内部向量和标量边界；signature、cbuffer、纹理参数与返回值保持标量接口，不能把向量传入不支持的 DXIL 重载。PSV/ViewID 分析逐分量传播依赖，避免将一个向量的所有输入误记为每个输出的依赖。SM 6.5 入口拒绝外部构造的原生向量 IR；GLSL 前端根据目标选择合法表示。
+
+### 显式堆布局与 ABI
+
+Zig 请求设置 `.target = .sm69`、`.binding_mode = .direct_heap`，可用 `.heap_layout = .{ .resource_base = 3, .sampler_base = 5 }` 预留宿主槽位。默认仍为 `.descriptor_tables`。C 旧 options/result 结构大小不变；新入口 `glsl2hlsl_dxil_compile_graphics_ex` 接受 `glsl2hlsl_dxil_graphics_options_ex`，必须设置 `struct_size = sizeof(options)`，并填入原有 `base` 请求。SM 6.5 的堆请求返回 UNSUPPORTED_TARGET；非法扩展大小/枚举返回 INVALID_ARGUMENT；堆槽越界返回带诊断的 INVALID_SHADER。
+
+`glsl2hlsl_dxil_graphics_execution_info` / C++ `execution_info()` 返回目标、DXIL/validator 版本（十进制 19 表示 1.9）、PSV 版本、原生向量使用情况、feature flags、最小资源绑定层级、根签名版本（10/11）、根标志以及堆映射。info 是值拷贝，内部 `heap_bindings` 是结果拥有的借用数组，释放结果后失效；getter 拒绝失败或已释放的结果。
+
+堆映射的 `binding_index` 指向原反射 binding 数组，`heap_index` 是选定堆的绝对槽位。CBV 和 SRV 按反射顺序共用资源堆，sampler 使用独立堆；每个绑定占一槽，VS/PS 共用同一分配。资源堆最多 1,000,000 槽、sampler 堆最多 2,048 槽，基址和实际槽位均受此约束。反射的完整资源名、寄存器、space、uniform 布局和阶段接口与 SM 6.5 相同；直接堆产物不声明描述符表范围。
+
+本阶段支持编译时分配的统一堆索引，不增加运行时索引表达式、sampler 数组或非一致资源访问。实际访问生成 `createHandleFromHeap` + `annotateHandle`。
+
+### 宿主设置顺序
+
+1. 用 `CheckFeatureSupport(SHADER_MODEL)` 确认 SM 6.9；原生向量不需要额外设备开关。堆模式还要求 ResourceBindingTier 3 和 Root Signature 1.1。离线编译 API 不查询设备，不会自动降级目标。
+2. 创建 shader-visible CBV/SRV/UAV 与 sampler 堆，按反射绝对槽位写描述符。CBV 的资源地址/大小仍按 256 字节对齐。
+3. 用执行要求的 `root_flags` 创建 Root Signature：资源堆标志 `0x400`、sampler 堆标志 `0x800`，按实际阶段用量取并集。堆模式不需要为这些资源创建 root 参数或描述符表。
+4. 录制命令时先 `SetDescriptorHeaps`，再 `SetGraphicsRootSignature`，然后 Draw。直接索引要求此顺序；更换堆后重新设置根签名。继续使用反射及 GL helper 上传 Globals/GlCompat。
+
+### 验收与工具
+
+`tests/dxil/run.ps1` 从 NuGet 下载固定 Microsoft.Direct3D.D3D12 1.620.1，核对 `baseline.json` 中 SHA256，仅在 `zig-out/dxil/agility/` 部署测试渲染器需要的 D3D12Core/SDKLayers。下载包缓存保留于 `.zig-cache/dxil-reference/`。Agility SDK 属于测试宿主的 D3D12 运行时，未链接进发布编译库；其许可证以下载包内条款为准，生成 DLL 不提交。默认手动编译渲染器使用系统运行时；传 `-DGLSL2HLSL_TEST_AGILITY=620` 才启用对应测试 DLL。
+
+完整脚本先执行 M1/M2，再以 `--m3` 在每个支持 SM 6.9 的硬件适配器运行相同源码的三种配置：6.5 描述符表、6.9 描述符表、6.9 直接堆。比较全部资源/结构体布局和接口，并保留 6.5 实际回读值，对比 6.9 全部像素及深度；同时保留独立 CPU 与 HLSL 坐标断言。专用向量场景验证 2/3/4 分量、浮点除法、整数移位/XOR 和非对称 lane；反汇编必须包含真实向量指令。
+
+2026-11-02 完整实测：M2 的 80 个容器与 M3 的 100 个容器原样通过官方 validator，重算摘要的签名损坏负例全部被拒绝。RTX 5070 Laptop 通过三种配置各 128 个 16×16 场景（含 96 组 GL 状态），资源、接口、像素、深度一致；Intel UHD 通过 128 个 SM 6.5 场景，设备最高 SM 6.7，明确跳过 6.9。发布 DLL 和渲染进程无编译/验证 DLL 依赖。没有 SM 6.9 硬件时完整脚本失败，`-SkipHardware` 标为部分验收。
+
+重跑入口为 `pwsh -NoProfile -File tests/dxil/run.ps1`；M3 结果位于 `report.json` 的 `m3` 字段、`m3-validation.txt`、`m3-render.txt` 和 `m3/vectors.frag.dxil.ll`。额外输出目录 `m3-heap/` 保存堆模式产物；与 `m2/`、`m3/` 的反射逐份比较。测试目录和文件数量随覆盖扩大而变化。

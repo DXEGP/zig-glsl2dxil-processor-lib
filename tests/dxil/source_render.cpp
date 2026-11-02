@@ -15,10 +15,17 @@
 #include <iostream>
 #include <iterator>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
+#if defined(GLSL2HLSL_TEST_AGILITY)
+extern "C" {
+__declspec(dllexport) extern const UINT D3D12SDKVersion = GLSL2HLSL_TEST_AGILITY;
+__declspec(dllexport) extern const char *D3D12SDKPath = ".\\agility\\";
+}
+#endif
 using Color = std::array<float, 4>;
 using Attributes = std::map<unsigned, std::array<Color, 3>>;
 static constexpr unsigned extent = 16;
@@ -26,6 +33,38 @@ static constexpr Color clear_color = {-9, -9, -9, -9};
 static ID3D12InfoQueue *active_messages = nullptr;
 static bool reference_coordinates = false;
 static unsigned compilation_index = 0;
+static bool modern_target = false;
+static bool direct_heap = false;
+
+static std::string reflection_key(const glsl2hlsl_dxil_graphics_result &value) {
+    std::ostringstream key;
+    const auto type = [&key](const glsl2hlsl_dxil_type &typ) {
+        key << typ.scalar << ',' << typ.rows << ',' << typ.columns << ',' << typ.array_length << ',' << typ.structure_index << ';';
+    };
+    key << value.reflection_version << ',' << value.coordinates << ',' << value.uniform_count << ',' << value.binding_count << ',' << value.structure_count << ',' << value.signature_count << ';';
+    for (size_t index = 0; index < value.uniform_count; ++index) {
+        const auto &uniform = value.uniforms[index];
+        key << uniform.name << ':'; type(uniform.type);
+        key << uniform.offset << ',' << uniform.size << ',' << uniform.array_stride << ',' << uniform.matrix_stride << ',' << uniform.stages << ';';
+    }
+    for (size_t index = 0; index < value.binding_count; ++index) {
+        const auto &binding = value.bindings[index];
+        key << binding.name << ':' << binding.resource_class << ',' << binding.binding << ',' << binding.space << ',' << binding.size << ',' << binding.stages << ';';
+    }
+    for (size_t index = 0; index < value.structure_count; ++index) {
+        const auto &structure = value.structures[index];
+        key << structure.name << ':' << structure.size << ',' << structure.field_count << ';';
+        for (size_t field_index = 0; field_index < structure.field_count; ++field_index) {
+            const auto &field = structure.fields[field_index];
+            key << field.name << ':' << field.offset << ';'; type(field.type);
+        }
+    }
+    for (size_t index = 0; index < value.signature_count; ++index) {
+        const auto &signature = value.signatures[index];
+        key << signature.name << ':' << signature.semantic_index << ',' << signature.row << ',' << signature.columns << ',' << signature.scalar << ',' << signature.semantic << ',' << signature.interpolation << ',' << signature.stage << ',' << signature.is_input << ';';
+    }
+    return key.str();
+}
 
 static void require(bool condition, const std::string &message) {
     if (!condition) throw std::runtime_error(message);
@@ -55,11 +94,19 @@ static std::string read_source(const char *path) {
 
 static glsl2hlsl::GraphicsResult compile(std::string_view vertex, std::string_view fragment, bool native = false) {
     auto result = glsl2hlsl::compile_graphics({.vertex=vertex, .fragment=fragment,
-        .coordinates=native ? glsl2hlsl::Coordinates::D3D12Native : glsl2hlsl::Coordinates::OpenGL});
+        .shader_model=modern_target ? GLSL2HLSL_SM_6_9 : GLSL2HLSL_SM_6_5,
+        .coordinates=native ? glsl2hlsl::Coordinates::D3D12Native : glsl2hlsl::Coordinates::OpenGL,
+        .binding_mode=direct_heap ? glsl2hlsl::BindingMode::DirectHeap : glsl2hlsl::BindingMode::DescriptorTables,
+        .resource_heap_base=3, .sampler_heap_base=5});
     for (const auto &diagnostic : result.diagnostics())
         std::cerr << diagnostic.source_name << ':' << diagnostic.line << ':' << diagnostic.column << ": " << diagnostic.message << '\n';
     require(bool(result), "GLSL source compilation failed");
-    const auto prefix = "zig-out/dxil/m2/runtime-" + std::to_string(compilation_index++);
+    if (modern_target) {
+        auto baseline = glsl2hlsl::compile_graphics({.vertex=vertex, .fragment=fragment,
+            .coordinates=native ? glsl2hlsl::Coordinates::D3D12Native : glsl2hlsl::Coordinates::OpenGL});
+        require(bool(baseline) && reflection_key(baseline.reflection()) == reflection_key(result.reflection()), "SM6.5/6.9 resource, layout or stage interface mismatch");
+    }
+    const auto prefix = std::string("zig-out/dxil/") + (direct_heap ? "m3-heap" : modern_target ? "m3" : "m2") + "/runtime-" + std::to_string(compilation_index++);
     std::ofstream(prefix+".vert.dxil",std::ios::binary).write(reinterpret_cast<const char *>(result.vertex().data()),result.vertex().size());
     std::ofstream(prefix+".frag.dxil",std::ios::binary).write(reinterpret_cast<const char *>(result.fragment().data()),result.fragment().size());
     ensure_no_compiler();
@@ -146,6 +193,7 @@ struct Draw {
 class Renderer {
     ID3D12Device *device;
     ComPtr<ID3D12CommandQueue> queue;
+    std::map<std::string, std::vector<float>> baseline_pixels;
 
     ComPtr<ID3D12Resource> resource(const D3D12_RESOURCE_DESC &desc, D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES state) {
         const auto properties = heap(type);
@@ -183,6 +231,8 @@ public:
     void run(const std::string &name, const glsl2hlsl::GraphicsResult &program, const Draw &draw) {
         std::cout << "case=" << name << std::endl;
         const auto &reflection = program.reflection();
+        const auto execution = program.execution_info();
+        const bool heap_mode = execution.binding_mode == GLSL2HLSL_DXIL_DIRECT_HEAP;
         glsl2hlsl_dxil_gl_prepared prepared{};
         require(glsl2hlsl::prepare_gl_state(draw.state, prepared) == glsl2hlsl::Status::Ok, "invalid GL state in test");
         ComPtr<ID3D12InfoQueue> messages;
@@ -195,6 +245,13 @@ public:
         unsigned srv_count = 0, sampler_count = 0;
         for (size_t index = 0; index < reflection.binding_count; ++index) {
             const auto &binding = reflection.bindings[index];
+            if (heap_mode) {
+                require(execution.heap_binding_count == reflection.binding_count && execution.heap_bindings[index].binding_index == index, "heap reflection mismatch");
+                const auto count = execution.heap_bindings[index].heap_index + 1;
+                if (binding.resource_class == GLSL2HLSL_DXIL_SAMPLER_STATE) sampler_count = std::max(sampler_count, count);
+                else srv_count = std::max(srv_count, count);
+                continue;
+            }
             auto &parameter = parameters[index];
             parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
             if (binding.resource_class == GLSL2HLSL_DXIL_CBUFFER) {
@@ -215,7 +272,12 @@ public:
         root_desc.pParameters = parameters.data();
         root_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
         ComPtr<ID3DBlob> blob, errors;
-        check(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors));
+        if (heap_mode) {
+            D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned{};
+            versioned.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+            versioned.Desc_1_1.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(root_desc.Flags | execution.root_flags);
+            check(D3D12SerializeVersionedRootSignature(&versioned, &blob, &errors));
+        } else check(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors));
         ComPtr<ID3D12RootSignature> root;
         check(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root)));
 
@@ -284,13 +346,13 @@ public:
         ComPtr<ID3D12GraphicsCommandList> commands;
         check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
         check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), pipeline.Get(), IID_PPV_ARGS(&commands)));
-        commands->SetGraphicsRootSignature(root.Get());
         std::vector<ComPtr<ID3D12Resource>> retained;
         ComPtr<ID3D12DescriptorHeap> srv_heap, sampler_heap;
         std::vector<ID3D12DescriptorHeap *> shader_heaps;
         if (srv_count) { srv_heap = descriptors(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, srv_count, true); shader_heaps.push_back(srv_heap.Get()); }
         if (sampler_count) { sampler_heap = descriptors(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, sampler_count, true); shader_heaps.push_back(sampler_heap.Get()); }
         if (!shader_heaps.empty()) commands->SetDescriptorHeaps(static_cast<UINT>(shader_heaps.size()), shader_heaps.data());
+        commands->SetGraphicsRootSignature(root.Get());
         unsigned srv_index = 0, sampler_index = 0;
         for (UINT index = 0; index < reflection.binding_count; ++index) {
             const auto &binding = reflection.bindings[index];
@@ -317,7 +379,12 @@ public:
                     }
                 }
                 retained.push_back(upload(words.data(), words.size()*4));
-                commands->SetGraphicsRootConstantBufferView(index, retained.back()->GetGPUVirtualAddress());
+                if (heap_mode) {
+                    D3D12_CONSTANT_BUFFER_VIEW_DESC view{retained.back()->GetGPUVirtualAddress(), static_cast<UINT>(words.size()*4)};
+                    auto cpu = srv_heap->GetCPUDescriptorHandleForHeapStart();
+                    cpu.ptr += execution.heap_bindings[index].heap_index * device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                    device->CreateConstantBufferView(&view, cpu);
+                } else commands->SetGraphicsRootConstantBufferView(index, retained.back()->GetGPUVirtualAddress());
             } else if (binding.resource_class == GLSL2HLSL_DXIL_SRV) {
                 const auto desc = texture_desc(DXGI_FORMAT_R32G32B32A32_FLOAT, 4, D3D12_RESOURCE_FLAG_NONE);
                 auto texture = resource(desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -343,9 +410,10 @@ public:
                 view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; view.Texture2D.MipLevels = 4;
                 auto cpu = srv_heap->GetCPUDescriptorHandleForHeapStart(); auto gpu = srv_heap->GetGPUDescriptorHandleForHeapStart();
                 const unsigned stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-                cpu.ptr += srv_index*stride; gpu.ptr += srv_index*stride; ++srv_index;
+                const auto slot = heap_mode ? execution.heap_bindings[index].heap_index : srv_index++;
+                cpu.ptr += slot*stride; gpu.ptr += slot*stride;
                 device->CreateShaderResourceView(texture.Get(), &view, cpu);
-                commands->SetGraphicsRootDescriptorTable(index, gpu);
+                if (!heap_mode) commands->SetGraphicsRootDescriptorTable(index, gpu);
                 retained.push_back(std::move(texture)); retained.push_back(std::move(source_buffer));
             } else {
                 D3D12_SAMPLER_DESC sampler{};
@@ -355,9 +423,10 @@ public:
                 sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
                 auto cpu = sampler_heap->GetCPUDescriptorHandleForHeapStart(); auto gpu = sampler_heap->GetGPUDescriptorHandleForHeapStart();
                 const unsigned stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
-                cpu.ptr += sampler_index*stride; gpu.ptr += sampler_index*stride; ++sampler_index;
+                const auto slot = heap_mode ? execution.heap_bindings[index].heap_index : sampler_index++;
+                cpu.ptr += slot*stride; gpu.ptr += slot*stride;
                 device->CreateSampler(&sampler, cpu);
-                commands->SetGraphicsRootDescriptorTable(index, gpu);
+                if (!heap_mode) commands->SetGraphicsRootDescriptorTable(index, gpu);
             }
         }
 
@@ -420,6 +489,7 @@ public:
         const HRESULT event_status = fence->SetEventOnCompletion(1, event);
         const DWORD wait = SUCCEEDED(event_status) ? WaitForSingleObject(event, 10000) : WAIT_FAILED;
         CloseHandle(event); check(event_status); require(wait == WAIT_OBJECT_0, "GPU timed out");
+        std::vector<float> pixels;
         for (unsigned index = 0; index < readbacks.size(); ++index) {
             auto &readback = readbacks[index];
             void *mapped; const D3D12_RANGE range{0, static_cast<SIZE_T>(readback.size)};
@@ -428,10 +498,12 @@ public:
                 const bool covered = !draw.no_coverage && column+0.5f >= viewport.TopLeftX && column+0.5f < viewport.TopLeftX+viewport.Width && row+0.5f >= viewport.TopLeftY && row+0.5f < viewport.TopLeftY+viewport.Height;
                 const auto *actual = reinterpret_cast<const float *>(static_cast<const char *>(mapped)+readback.footprint.Offset+row*readback.footprint.Footprint.RowPitch);
                 if (index == target_count) {
+                    pixels.push_back(actual[column]);
                     if (!draw.expected_depth) continue;
                     const float expected = covered ? draw.expected_depth(column, row) : 0.9375f;
                     require(std::isfinite(actual[column]) && std::abs(actual[column]-expected)<0.00002f, name+": depth mismatch at "+std::to_string(column)+","+std::to_string(row));
                 } else {
+                    for (unsigned channel = 0; channel < 4; ++channel) pixels.push_back(actual[column*4+channel]);
                     const auto expected = covered ? draw.expected(column, row, index) : clear_color;
                     for (unsigned channel = 0; channel < 4; ++channel) if (!std::isfinite(actual[column*4+channel]) || std::abs(actual[column*4+channel]-expected[channel])>0.0002f) {
                         std::cerr << "pixel=" << column << ',' << row << " target=" << index << " channel=" << channel << " actual=" << actual[column*4+channel] << " expected=" << expected[channel] << '\n';
@@ -441,6 +513,12 @@ public:
             }
             D3D12_RANGE empty{}; readback.buffer->Unmap(0, &empty);
         }
+        if (modern_target) {
+            const auto found = baseline_pixels.find(name);
+            require(found != baseline_pixels.end() && found->second.size() == pixels.size(), "missing SM6.5 pixel baseline");
+            for (size_t index = 0; index < pixels.size(); ++index)
+                require(std::isfinite(pixels[index]) && std::abs(pixels[index]-found->second[index]) < 0.0002f, name+": SM6.5/6.9 pixel or depth mismatch");
+        } else baseline_pixels[name] = std::move(pixels);
         for (UINT64 index = 0; index < messages->GetNumStoredMessages(); ++index) {
             SIZE_T size = 0; check(messages->GetMessage(index, nullptr, &size)); std::vector<char> storage(size);
             auto *message = reinterpret_cast<D3D12_MESSAGE *>(storage.data()); check(messages->GetMessage(index, message, &size));
@@ -476,6 +554,14 @@ static void acceptance(Renderer &renderer) {
     draw.integer("count", 6);
     draw.expected = [](unsigned, unsigned, unsigned) { return Color{15.5f, 35, 0, 1}; };
     renderer.run("ssa-control-copyout", flow, draw);
+
+    auto vectors = compile(basic_vertex, read_source("tests/dxil/vectors.frag"), true);
+    Draw vector_draw;
+    vector_draw.floats("a", {0.1f,0.2f,0.3f,0.4f}); vector_draw.floats("b", {0.5f,0.6f,0.7f,0.8f});
+    vector_draw.uniforms["integers"] = {1,2,3,4}; vector_draw.uniforms["shifts"] = {0,1,2,3};
+    vector_draw.expected = [](unsigned,unsigned,unsigned) { return Color{0.9f,0.12f,15,0.6f}; };
+    require(!modern_target || vectors.execution_info().native_vectors, "native vector arithmetic missing from SM6.9 output");
+    renderer.run("native-vectors-float-int-2-3-4", vectors, vector_draw);
 
     auto matrices = compile(basic_vertex, R"(
         uniform mat3 matrix; uniform float weights[3]; uniform vec3 vector_value; uniform float tail;
@@ -576,8 +662,9 @@ static void acceptance(Renderer &renderer) {
         void main(){first=vec4(gl_FragCoord.xyz/vec3(16,16,1),gl_FrontFacing ? 1.0 : 0.0);
             second=vec4(float(instance_id),gl_FragCoord.w,float(vertex_id),1);gl_FragDepth=gl_FragCoord.z;}
         )");
-    std::ofstream("zig-out/dxil/m2/coordinates.vert.dxil",std::ios::binary).write(reinterpret_cast<const char *>(coordinates.vertex().data()),coordinates.vertex().size());
-    std::ofstream("zig-out/dxil/m2/coordinates.frag.dxil",std::ios::binary).write(reinterpret_cast<const char *>(coordinates.fragment().data()),coordinates.fragment().size());
+    const auto coordinate_directory = std::string("zig-out/dxil/") + (direct_heap ? "m3-heap" : modern_target ? "m3" : "m2");
+    std::ofstream(coordinate_directory+"/coordinates.vert.dxil",std::ios::binary).write(reinterpret_cast<const char *>(coordinates.vertex().data()),coordinates.vertex().size());
+    std::ofstream(coordinate_directory+"/coordinates.frag.dxil",std::ios::binary).write(reinterpret_cast<const char *>(coordinates.fragment().data()),coordinates.fragment().size());
     unsigned combination=0;
     for(unsigned origin : {0u,1u}) for(unsigned clip : {0u,1u}) for(auto range : {std::array{0.0f,1.0f},std::array{0.2f,0.8f},std::array{0.8f,0.2f}})
     for(unsigned winding : {0u,1u}) for(unsigned base : {0u,7u}) for(bool offset : {false,true}) {
@@ -610,13 +697,15 @@ static void acceptance(Renderer &renderer) {
     renderer.run("gl-zero-w",coordinates,zero_w);
 }
 
-int main(int argc, char **) {
+int main(int argc, char **argv) {
     try {
-        reference_coordinates = argc > 1;
+        reference_coordinates = argc > 1 && std::string_view(argv[1]) == "--reference";
+        const bool m3 = argc > 1 && std::string_view(argv[1]) == "--m3";
         ensure_no_compiler();
         ComPtr<ID3D12Debug> debug; check(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))); debug->EnableDebugLayer();
         ComPtr<IDXGIFactory1> factory; check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
         unsigned tested = 0;
+        unsigned modern_tested = 0;
         for (UINT index = 0;; ++index) {
             ComPtr<IDXGIAdapter1> adapter; if (factory->EnumAdapters1(index, &adapter) == DXGI_ERROR_NOT_FOUND) break;
             DXGI_ADAPTER_DESC1 desc; check(adapter->GetDesc1(&desc)); if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
@@ -626,8 +715,25 @@ int main(int argc, char **) {
             char name[256]; WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name), nullptr, nullptr);
             std::cout << "adapter=" << name << " debug_layer=enabled\n";
             Renderer renderer(device.Get()); acceptance(renderer); ++tested;
+            if (m3) {
+                model.HighestShaderModel = static_cast<D3D_SHADER_MODEL>(0x69);
+                const bool sm69 = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model))) && model.HighestShaderModel >= static_cast<D3D_SHADER_MODEL>(0x69);
+                D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+                check(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)));
+                D3D12_FEATURE_DATA_ROOT_SIGNATURE root_version{D3D_ROOT_SIGNATURE_VERSION_1_1};
+                check(device->CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &root_version, sizeof(root_version)));
+                char runtime[MAX_PATH]{}; GetModuleFileNameA(GetModuleHandleW(L"D3D12Core.dll"), runtime, MAX_PATH);
+                std::cout << "sm69=" << sm69 << " highest_model=0x" << std::hex << model.HighestShaderModel << std::dec << " binding_tier=" << options.ResourceBindingTier << " root_signature=" << root_version.HighestVersion << " runtime=" << runtime << '\n';
+                if (!sm69) { std::cout << "m3_skipped=SM6.9 unavailable\n"; continue; }
+                require(options.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_3 && root_version.HighestVersion >= D3D_ROOT_SIGNATURE_VERSION_1_1, "direct heap device requirements unavailable");
+                modern_target = true; direct_heap = false; acceptance(renderer);
+                direct_heap = true; acceptance(renderer);
+                modern_target = false; direct_heap = false; ++modern_tested;
+                std::cout << "m3_comparison=passed resources=equal interfaces=equal pixels_and_depth=equal\n";
+            }
         }
         require(tested != 0, "no SM6.5 hardware adapter"); std::cout << "source_hardware_adapters_passed=" << tested << '\n';
+        if (m3) { require(modern_tested != 0, "no SM6.9 hardware adapter; M3 acceptance incomplete"); std::cout << "m3_hardware_adapters_passed=" << modern_tested << '\n'; }
         return 0;
     } catch (const std::exception &error) { std::cerr << error.what() << '\n'; return 1; }
 }

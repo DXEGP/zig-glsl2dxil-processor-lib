@@ -1,7 +1,47 @@
 const std = @import("std");
 
 pub const Stage = enum { vertex, fragment };
-pub const Type = enum { void_, i1, i8, i32, f32, i8_ptr, handle, cb_f32, cb_i32, res_f32 };
+pub const Type = enum {
+    void_,
+    i1,
+    i8,
+    i32,
+    f32,
+    i8_ptr,
+    handle,
+    cb_f32,
+    cb_i32,
+    res_f32,
+    res_binding,
+    res_properties,
+    f32x2,
+    f32x3,
+    f32x4,
+    i32x2,
+    i32x3,
+    i32x4,
+    i64,
+
+    pub fn lanes(self: Type) u32 {
+        return switch (self) {
+            .f32x2, .i32x2 => 2,
+            .f32x3, .i32x3 => 3,
+            .f32x4, .i32x4 => 4,
+            else => 1,
+        };
+    }
+    pub fn scalar(self: Type) Type {
+        return switch (self) {
+            .f32x2, .f32x3, .f32x4 => .f32,
+            .i32x2, .i32x3, .i32x4 => .i32,
+            else => self,
+        };
+    }
+    pub fn vector(self: Type, count: u32) Type {
+        std.debug.assert(count >= 2 and count <= 4);
+        return @fromBackingInt(@intCast(@as(u32, @backingInt(if (self == .f32) Type.f32x2 else Type.i32x2)) + count - 2));
+    }
+};
 pub const ValueId = u32;
 pub const BlockId = u32;
 pub const BinaryOp = enum { add, sub, mul, udiv, sdiv, fdiv, urem, srem, shl, lshr, ashr, and_, or_, xor_ };
@@ -17,6 +57,9 @@ pub const Op = enum {
     binary,
     tertiary,
     create_handle,
+    create_binding,
+    create_heap,
+    annotate,
     cbuffer_f32,
     cbuffer_i32,
     sample,
@@ -36,6 +79,9 @@ pub const Op = enum {
             .binary => .{ .name = "dx.op.binary.f32", .ret = .f32, .params = &.{ .i32, .f32, .f32 }, .opcode = 0 },
             .tertiary => .{ .name = "dx.op.tertiary.f32", .ret = .f32, .params = &.{ .i32, .f32, .f32, .f32 }, .opcode = 0 },
             .create_handle => .{ .name = "dx.op.createHandle", .ret = .handle, .params = &.{ .i32, .i8, .i32, .i32, .i1 }, .opcode = 57, .memory = .read },
+            .create_binding => .{ .name = "dx.op.createHandleFromBinding", .ret = .handle, .params = &.{ .i32, .res_binding, .i32, .i1 }, .opcode = 217, .memory = .read },
+            .create_heap => .{ .name = "dx.op.createHandleFromHeap", .ret = .handle, .params = &.{ .i32, .i32, .i1, .i1 }, .opcode = 218, .memory = .read },
+            .annotate => .{ .name = "dx.op.annotateHandle", .ret = .handle, .params = &.{ .i32, .handle, .res_properties }, .opcode = 216 },
             .cbuffer_f32 => .{ .name = "dx.op.cbufferLoadLegacy.f32", .ret = .cb_f32, .params = &.{ .i32, .handle, .i32 }, .opcode = 59, .memory = .read },
             .cbuffer_i32 => .{ .name = "dx.op.cbufferLoadLegacy.i32", .ret = .cb_i32, .params = &.{ .i32, .handle, .i32 }, .opcode = 59, .memory = .read },
             .sample => .{ .name = "dx.op.sample.f32", .ret = .res_f32, .params = &.{ .i32, .handle, .handle, .f32, .f32, .f32, .f32, .i32, .i32, .i32, .f32 }, .opcode = 60, .memory = .read },
@@ -49,7 +95,10 @@ pub const Op = enum {
 pub const Incoming = struct { value: ValueId, block: BlockId };
 pub const Instruction = union(enum) {
     constant: u32,
+    aggregate: [4]u32,
     undef,
+    insert: struct { vector: ValueId, value: ValueId, index: ValueId },
+    element: struct { vector: ValueId, index: ValueId },
     binary: struct { op: BinaryOp, left: ValueId, right: ValueId },
     compare: struct { predicate: Predicate, left: ValueId, right: ValueId },
     cast: struct { op: CastOp, value: ValueId },
@@ -130,7 +179,7 @@ pub const Module = struct {
         const result: ValueId = @intCast(self.values.items.len);
         try self.values.append(self.allocator, .{ .typ = typ, .instruction = instruction });
         errdefer _ = self.values.pop();
-        if (instruction != .constant and instruction != .undef) {
+        if (instruction != .constant and instruction != .undef and instruction != .aggregate) {
             try self.blocks.items[self.current].values.append(self.allocator, result);
         }
         return result;
@@ -210,7 +259,7 @@ pub const Module = struct {
             for (block_value.values.items, 0..) |value_id, position| {
                 if (value_id >= self.values.items.len or owners[value_id] != null) return invalid;
                 const value = self.values.items[value_id];
-                if (value.instruction == .constant or value.instruction == .undef) return invalid;
+                if (value.instruction == .constant or value.instruction == .undef or value.instruction == .aggregate) return invalid;
                 if (value.instruction == .phi) {
                     if (non_phi) return invalid;
                 } else non_phi = true;
@@ -258,8 +307,14 @@ pub const Module = struct {
             };
         }
         for (self.values.items, 0..) |value, value_index| {
+            if (value.instruction == .aggregate) {
+                if (value.typ != .res_binding and value.typ != .res_properties) return invalid;
+                if (value.typ == .res_binding and value.instruction.aggregate[3] > 3) return invalid;
+                continue;
+            }
             if (value.instruction == .constant or value.instruction == .undef) {
-                if (value.typ != .i1 and value.typ != .i8 and value.typ != .i32 and value.typ != .f32) return invalid;
+                if (value.typ.scalar() != .i1 and value.typ.scalar() != .i8 and value.typ.scalar() != .i32 and value.typ.scalar() != .f32) return invalid;
+                if (value.instruction == .constant and value.typ.lanes() != 1) return invalid;
                 if (value.instruction == .constant and ((value.typ == .i1 and value.instruction.constant > 1) or (value.typ == .i8 and value.instruction.constant > 255))) return invalid;
                 continue;
             }
@@ -267,14 +322,28 @@ pub const Module = struct {
             var operands: [16]ValueId = undefined;
             var length: usize = 0;
             switch (value.instruction) {
-                .constant, .undef => unreachable,
+                .constant, .undef, .aggregate => unreachable,
+                .insert => |operation| {
+                    operands[0..3].* = .{ operation.vector, operation.value, operation.index };
+                    length = 3;
+                    if (value.typ.lanes() == 1 or !self.hasType(operation.vector, value.typ) or !self.hasType(operation.value, value.typ.scalar()) or !self.hasType(operation.index, .i32)) return invalid;
+                    if (self.immediate(operation.index)) |index| if (index >= value.typ.lanes()) return invalid;
+                },
+                .element => |operation| {
+                    operands[0..2].* = .{ operation.vector, operation.index };
+                    length = 2;
+                    if (operation.vector >= self.values.items.len or !self.hasType(operation.index, .i32)) return invalid;
+                    const vector = self.values.items[operation.vector].typ;
+                    if (vector.lanes() == 1 or vector.scalar() != value.typ) return invalid;
+                    if (self.immediate(operation.index)) |index| if (index >= vector.lanes()) return invalid;
+                },
                 .binary => |operation| {
                     operands[0..2].* = .{ operation.left, operation.right };
                     length = 2;
                     if (!self.hasType(operation.left, value.typ) or !self.hasType(operation.right, value.typ)) return invalid;
-                    if (value.typ != .f32 and value.typ != .i32 and value.typ != .i1) return invalid;
-                    if (value.typ == .f32 and operation.op != .add and operation.op != .sub and operation.op != .mul and operation.op != .fdiv) return invalid;
-                    if (value.typ != .f32 and operation.op == .fdiv) return invalid;
+                    if (value.typ.scalar() != .f32 and value.typ.scalar() != .i32 and value.typ != .i1) return invalid;
+                    if (value.typ.scalar() == .f32 and operation.op != .add and operation.op != .sub and operation.op != .mul and operation.op != .fdiv) return invalid;
+                    if (value.typ.scalar() != .f32 and operation.op == .fdiv) return invalid;
                     if (value.typ == .i1 and operation.op != .and_ and operation.op != .or_ and operation.op != .xor_) return invalid;
                 },
                 .compare => |operation| {
@@ -337,6 +406,19 @@ pub const Module = struct {
                             };
                             if (!found) return invalid;
                         },
+                        .create_heap => {
+                            if (self.immediate(operation.args[2]) == null or self.immediate(operation.args[3]) == null) return invalid;
+                        },
+                        .create_binding => {
+                            if (self.values.items[operation.args[1]].instruction != .aggregate) return invalid;
+                            const binding = self.values.items[operation.args[1]].instruction.aggregate;
+                            var found = false;
+                            for (self.resources.items) |resource| if (@backingInt(resource.class) == binding[3] and resource.binding == binding[0] and binding[0] == binding[1] and resource.space == binding[2]) {
+                                found = true;
+                            };
+                            if (!found) return invalid;
+                        },
+                        .annotate => if (self.values.items[operation.args[2]].instruction != .aggregate) return invalid,
                         .sample => if (self.stage != .fragment) return invalid,
                         .discard => if (self.stage != .fragment) return invalid,
                         else => {},
@@ -401,6 +483,27 @@ fn integerBits(typ: Type) u32 {
         .i32 => 32,
         else => 0,
     };
+}
+
+test "native vector verification rejects out of bounds lanes and vector signature arguments" {
+    var module = Module.init(std.testing.allocator, .fragment);
+    defer module.deinit();
+    _ = try module.block();
+    try module.outputs.append(std.testing.allocator, .{ .name = "SV_Target", .semantic = .target, .columns = 1 });
+    const vector = try module.undef(.f32x3);
+    const index = try module.constant(.i32, 2);
+    const inserted = try module.add(.f32x3, .{ .insert = .{ .vector = vector, .value = try module.float(0.75), .index = index } });
+    const extracted = try module.add(.f32, .{ .element = .{ .vector = inserted, .index = index } });
+    module.terminate(.ret);
+    try module.verify(std.testing.allocator);
+    module.values.items[index].instruction.constant = 3;
+    try std.testing.expectError(error.InvalidIr, module.verify(std.testing.allocator));
+    module.values.items[index].instruction.constant = 2;
+    module.values.items[extracted].typ = .i32;
+    try std.testing.expectError(error.InvalidIr, module.verify(std.testing.allocator));
+    module.values.items[extracted].typ = .f32;
+    _ = try module.intrinsic(.store_f32, &.{ try module.constant(.i32, 0), try module.constant(.i32, 0), try module.constant(.i8, 0), inserted });
+    try std.testing.expectError(error.InvalidIr, module.verify(std.testing.allocator));
 }
 
 test "IR verifier rejects invalid signature access and impossible casts" {

@@ -90,9 +90,9 @@ powershell -File tests/run.ps1
 
 `cpp-test` 用 `-std=c++23` 和 `-std=c++26` 分别编译并运行同一份互操作测试。`tests/run.ps1` 还会转换 `tests/shaders` 与 `examples` 下的全部着色器，并在找到 `dxc.exe` 时验证生成的 HLSL。
 
-实验性 DXIL 后端支持将配对 GLSL 顶点/片元源码直接编译为 SM 6.5 / DXIL 1.5，包含类型化标量 SSA、函数与控制流、浮点矩阵、uniform 布局反射、sampler2D 描述符表，以及可配置 OpenGL 坐标/绘制状态。Zig 使用 `compileGraphics`，C 使用 `glsl2hlsl_dxil_compile_graphics`，C++23/26 提供只移动的 `GraphicsResult`。宿主按返回的 cbuffer 偏移和步长上传 uniform。
+实验性 DXIL 后端支持将配对 GLSL 顶点/片元源码直接编译为 SM 6.5 / DXIL 1.5 或 SM 6.9 / DXIL 1.9，包含类型化 SSA、函数与控制流、浮点矩阵、uniform 布局反射、sampler2D 描述符表，以及可配置 OpenGL 坐标/绘制状态。SM 6.9 保留原生浮点/整数向量算术，并支持显式选择描述符堆直接索引。Zig 使用 `compileGraphics`，C 使用 `glsl2hlsl_dxil_compile_graphics` 或扩展 `_ex` 请求，C++23/26 提供只移动的 `GraphicsResult`。宿主按反射偏移和步长上传 uniform，并查询执行要求以选择设备与根签名配置。
 
-运行 `zig build test c-test cpp-test dxil-c-test dxil-source-fixtures`、`zig build dxil-source-bench -Doptimize=ReleaseSafe`，或用 `pwsh -NoProfile -File tests/dxil/run.ps1` 执行 Windows 官方校验与 GPU 回读，覆盖既有 10 个 shader 和 96 组 OpenGL 状态。核心无 DXC/LLVM 依赖；官方工具仅用于开发验收。SM 6.9、通用 GLSL/真实包兼容、UBO/SSBO、sampler 数组和局部聚合对象动态写入仍不支持；详见[支持契约](docs/dxil.md#m2glsl-源码编译与反射)。
+运行 `zig build test c-test cpp-test dxil-c-test dxil-source-fixtures`、`zig build dxil-source-bench -Doptimize=ReleaseSafe`，或用 `pwsh -NoProfile -File tests/dxil/run.ps1` 执行 Windows 官方校验与 GPU 回读，覆盖既有 10 个 shader 和 96 组 OpenGL 状态。脚本比较两个目标及 SM 6.9 两种绑定方式的布局、接口、像素与深度，为测试渲染器下载固定版本的 Agility SDK，完整验收需要 SM 6.9 硬件。核心无 DXC/LLVM 依赖；官方工具仅用于开发验收。通用 GLSL/真实包兼容、UBO/SSBO、sampler 数组、非一致资源索引和局部聚合对象动态写入仍不支持；详见[支持契约](docs/dxil.md#m2glsl-源码编译与反射)与 [SM 6.9 宿主要求](docs/dxil.md#m3sm-69-合法化与宿主要求)。
 
 ## 限制
 

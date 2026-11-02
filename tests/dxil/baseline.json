@@ -2,6 +2,14 @@
   "schema": 1,
   "zig": "0.17.0",
   "target": "SM 6.5 / DXIL 1.5 / validator compatibility 1.5 / PSV v1",
+  "m3Target": "SM 6.9 / DXIL 1.9 / validator compatibility 1.9 / PSV v3",
+  "agility": {
+    "package": "Microsoft.Direct3D.D3D12",
+    "version": "1.620.1",
+    "sdkVersion": 620,
+    "sha256": "A8A494C3E5F687D9BE0A465EC8248DA70781AB689D888DB8806B600422722BE6",
+    "url": "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.d3d12/1.620.1/microsoft.direct3d.d3d12.1.620.1.nupkg"
+  },
   "references": {
     "DirectXShaderCompiler": "f9fc72ad3fd796227400ef6f52097968f843f7ee",
     "hlsl-specs": "9a8866f45599457900876fba0d02caf3a1e8544c",

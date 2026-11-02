@@ -2,6 +2,7 @@ const std = @import("std");
 const ast = @import("../glsl/ast.zig");
 const sema = @import("sema.zig");
 const ir = @import("ir.zig");
+const target_config = @import("target.zig");
 const Error = sema.Error;
 const Value = struct { typ: sema.Type, parts: []const ir.ValueId };
 const Variable = struct { name: []const u8, typ: sema.Type, slot: u32, readonly: bool = false, global: bool = false };
@@ -36,6 +37,9 @@ pub const Lowerer = struct {
     validation_entry: ?[]const u8 = null,
     source_location: ast.Location = .{ .line = 1, .column = 1 },
     expression_depth: u32 = 0,
+    native_vectors: bool = false,
+    binding_mode: target_config.BindingMode = .descriptor_tables,
+    heap_bindings: []const target_config.HeapBinding = &.{},
 
     pub fn init(allocator: std.mem.Allocator, program: *sema.Program, stage_index: usize) Lowerer {
         return .{ .allocator = allocator, .program = program, .stage_index = stage_index, .module = ir.Module.init(allocator, if (stage_index == 0) .vertex else .fragment) };
@@ -85,14 +89,20 @@ pub const Lowerer = struct {
                 },
             }
         }
-        for (self.program.bindings.items) |binding| {
+        for (self.program.bindings.items, 0..) |binding, binding_index| {
             if (binding.stages & (@as(u32, 1) << @intCast(self.stage_index)) == 0) continue;
             var range: u32 = 0;
             for (self.module.resources.items) |existing| if (existing.class == binding.class) {
                 range += 1;
             };
             try self.module.resources.append(self.allocator, .{ .name = binding.name, .class = binding.class, .binding = binding.binding, .space = binding.space, .size = binding.size });
-            const handle = try self.module.intrinsic(.create_handle, &.{ try self.integer(.i8, @backingInt(binding.class)), try self.integer(.i32, range), try self.integer(.i32, binding.binding), try self.integer(.i1, 0) });
+            const handle = if (self.binding_mode == .descriptor_tables)
+                try self.module.intrinsic(.create_handle, &.{ try self.integer(.i8, @backingInt(binding.class)), try self.integer(.i32, range), try self.integer(.i32, binding.binding), try self.integer(.i1, 0) })
+            else heap: {
+                const raw = try self.module.intrinsic(.create_heap, &.{ try self.integer(.i32, self.heap_bindings[binding_index].heap_index), try self.integer(.i1, @intFromBool(binding.class == .sampler)), try self.integer(.i1, 0) });
+                const props = try self.module.add(.res_properties, .{ .aggregate = target_config.properties(self.module.resources.items[self.module.resources.items.len - 1]) });
+                break :heap try self.module.intrinsic(.annotate, &.{ raw, props });
+            };
             try self.handles.append(self.allocator, handle);
         }
         for (stage.globals.items) |global| if (global.kind == .constant or global.kind == .plain) {
@@ -651,6 +661,25 @@ pub const Lowerer = struct {
         const comparison = equality or op == .less or op == .greater or op == .less_equal or op == .greater_equal;
         if (comparison and !equality and target.count() != 1) return self.fail(line, "relational operators require scalar operands", .{});
         const parts = try self.allocator.alloc(ir.ValueId, target.count());
+        const operation: ?ir.BinaryOp = if (comparison) null else switch (op) {
+            .add => .add,
+            .subtract => .sub,
+            .multiply => .mul,
+            .divide => if (target.scalar == .float) .fdiv else if (target.scalar == .uint) .udiv else .sdiv,
+            .remainder => if (target.scalar == .float) return self.fail(line, "% requires integer operands", .{}) else if (target.scalar == .uint) .urem else .srem,
+            .bit_and => .and_,
+            .bit_or => .or_,
+            .bit_xor => .xor_,
+            .shift_left => .shl,
+            .shift_right => if (target.scalar == .uint) .lshr else .ashr,
+            else => return self.fail(line, "unsupported operator", .{}),
+        };
+        if (operation) |binary_op| if (target.scalar == .float and (binary_op == .and_ or binary_op == .or_ or binary_op == .xor_ or binary_op == .shl or binary_op == .lshr or binary_op == .ashr)) return self.fail(line, "bitwise operators require integers", .{});
+        if (self.native_vectors and !comparison and target.partsShapeVector()) {
+            const vector = try self.module.binary(operation.?, try self.pack(left_value, target.rows), try self.pack(right_value, target.rows));
+            for (parts, 0..) |*part, component| part.* = try self.module.add(target.irType(), .{ .element = .{ .vector = vector, .index = try self.integer(.i32, @intCast(component)) } });
+            return .{ .typ = target, .parts = parts };
+        }
         for (parts, 0..) |*part, component| {
             const left_part = left_value.parts[if (left_value.parts.len == 1) 0 else component];
             const right_part = right_value.parts[if (right_value.parts.len == 1) 0 else component];
@@ -674,21 +703,7 @@ pub const Lowerer = struct {
                 };
                 part.* = try self.module.compare(predicate, left_part, right_part);
             } else {
-                const operation: ir.BinaryOp = switch (op) {
-                    .add => .add,
-                    .subtract => .sub,
-                    .multiply => .mul,
-                    .divide => if (target.scalar == .float) .fdiv else if (target.scalar == .uint) .udiv else .sdiv,
-                    .remainder => if (target.scalar == .float) return self.fail(line, "% requires integer operands", .{}) else if (target.scalar == .uint) .urem else .srem,
-                    .bit_and => .and_,
-                    .bit_or => .or_,
-                    .bit_xor => .xor_,
-                    .shift_left => .shl,
-                    .shift_right => if (target.scalar == .uint) .lshr else .ashr,
-                    else => return self.fail(line, "unsupported operator", .{}),
-                };
-                if (target.scalar == .float and (operation == .and_ or operation == .or_ or operation == .xor_ or operation == .shl or operation == .lshr or operation == .ashr)) return self.fail(line, "bitwise operators require integers", .{});
-                part.* = try self.module.binary(operation, left_part, right_part);
+                part.* = try self.module.binary(operation.?, left_part, right_part);
             }
         }
         if (comparison) {
@@ -697,6 +712,13 @@ pub const Lowerer = struct {
             return self.single(.{ .scalar = .bool_ }, result);
         }
         return .{ .typ = target, .parts = parts };
+    }
+
+    fn pack(self: *Lowerer, value: Value, count: u32) Error!ir.ValueId {
+        const typ = value.typ.irType().vector(count);
+        var vector = try self.module.undef(typ);
+        for (0..count) |component| vector = try self.module.add(typ, .{ .insert = .{ .vector = vector, .value = value.parts[if (value.parts.len == 1) 0 else component], .index = try self.integer(.i32, @intCast(component)) } });
+        return vector;
     }
 
     fn matrixMultiply(self: *Lowerer, left: Value, right: Value, line: u32) Error!Value {
